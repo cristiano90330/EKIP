@@ -1,0 +1,37 @@
+# 接收 Java 和 Python 的 OTLP 追踪，并由可选观测栈导出到本地与 Langfuse。
+
+# Langfuse 的 Basic 凭据通过观测 Compose 注入。
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 5s
+
+exporters:
+  # debug：把收到的 span 摘要打到 stdout（`docker logs ekip-otel-collector` 可查）
+  debug:
+    verbosity: normal
+  # file：落 JSONL，便于 `grep ekip.stage` 做机器可读的取证
+  file:
+    path: /out/traces.jsonl
+
+  # 完整观测方案中的 Langfuse 出口。
+  # Langfuse 的 OTLP/HTTP 入口；Authorization 用 Basic(public_key:secret_key)，
+  # 值由 compose 注入环境变量 LANGFUSE_BASIC_AUTH（仓库根 .env，gitignore）。
+  otlphttp/langfuse:
+    endpoint: http://langfuse-web:3000/api/public/otel
+    headers:
+      Authorization: "Basic ${env:LANGFUSE_BASIC_AUTH}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file, otlphttp/langfuse]

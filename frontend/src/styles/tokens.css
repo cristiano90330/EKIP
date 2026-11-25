@@ -1,0 +1,246 @@
+/** 为应用声明浅色和深色主题的颜色、间距、阴影与排版变量。 */
+
+/* ============================================================================
+ * EKIP 设计令牌（三层：primitive → semantic → component）
+ *
+ * 风格：Bento Box Grid（ui-ux-pro-max `bento-box-grid`）
+ *   模块化卡片 + 非对称栅格 · 卡片 20px / 控件 12px 圆角 · 双层柔影
+ *   16px 间距基数 · 单一品牌色（靛蓝）· 字重 400 / 600 / 650
+ *
+ * 与上一版（Swiss：圆角 0 / 阴影 none / 400·700 两档）是两套语言，
+ * 不是同一套的微调：层级由「卡片体积 + 柔影 + 圆角」表达，而非 1px 线。
+ *
+ * 主题切换靠 <html theme-mode="dark|light">：
+ *   - index.html 在首屏渲染前按 localStorage / prefers-color-scheme 预置
+ *   - src/theme.ts 维护，并在系统主题变化时同步
+ * ========================================================================== */
+
+/* ---------------------------------------------------------------------------
+ * 层 1：primitive —— 原始值，不直接出现在组件里
+ * ------------------------------------------------------------------------- */
+:root {
+  /* 中性阶（暗色端） */
+  --grey-950: #08080c;
+  --grey-900: #0b0b0f;
+  --grey-850: #101016;
+  --grey-800: #15151c;
+  --grey-750: #191922;
+  --grey-700: #1f1f2a;
+  --grey-600: #262633;
+  --grey-500: #35354a;
+  --grey-400: #55556b;
+  --grey-300: #9a9aac;
+  --grey-200: #c9c9d6;
+  --grey-100: #f1f1f6;
+  --grey-50: #f8f8fb;
+
+  /* 中性阶（亮色端） */
+  --paper-900: #111114;
+  --paper-800: #1c1c22;
+  --paper-700: #2f2f38;
+  --paper-500: #4b4b55;
+  --paper-400: #5e5e68;
+  --paper-350: #6a6a76;
+  --paper-300: #dadade;
+  --paper-250: #e8e8ed;
+  --paper-200: #efeff3;
+  --paper-100: #f5f5f7;
+  --paper-50: #fafafd;
+
+  /* 品牌色（全站唯一强调色）：靛蓝 */
+  --indigo-950: #1e1b4b;
+  --indigo-900: #29246b;
+  --indigo-800: #362f96;
+  --indigo-700: #4338ca;
+  --indigo-600: #4f46e5;
+  --indigo-500: #6366f1;
+  --indigo-400: #818cf8;
+  --indigo-300: #a5b4fc;
+  --indigo-200: #c7d2fe;
+  --indigo-100: #e8eaff;
+  --indigo-50: #eef0ff;
+
+  /* 状态色：文本场合一律取深色档以满足 4.5:1 */
+  --green-600: #0a7a54;
+  --green-500: #0e9f6e;
+  --green-300: #3dd68c;
+  --amber-700: #b45309;
+  --amber-600: #c2410c;
+  --amber-300: #f0a44a;
+  --red-700: #be1e3c;
+  --red-300: #ff7a8a;
+
+  --white: #ffffff;
+
+  /* -------------------------------------------------------------------------
+   * 尺度令牌（与主题无关）
+   * ----------------------------------------------------------------------- */
+
+  /* 间距：4px 基数，16px 为默认节奏（bento 的卡片间距即取此值） */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  /* 字阶：正文 14，卡片标题 16，页标题 26 */
+  --fs-micro: 10.5px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+  --fs-display: 34px;
+  --fs-read: 14.5px;
+
+  /* 字重：卡片标题 600，数值 650 拉开对比 */
+  --fw-normal: 400;
+  --fw-medium: 500;
+  --fw-semi: 600;
+  --fw-bold: 650;
+
+  --lh-tight: 1.3;
+  --lh-base: 1.6;
+  --lh-read: 1.75;
+
+  /* 圆角：卡片 20px、控件 12px、胶囊 999px */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-full: 999px;
+
+  /* 字体：全离线部署，只用系统字体（不引 Google Fonts） */
+  --font-sans: 'Segoe UI Variable Display', 'Segoe UI', 'Microsoft YaHei',
+    'PingFang SC', 'Hiragino Sans GB', system-ui, -apple-system, Arial, sans-serif;
+  --font-mono: 'Cascadia Mono', 'Consolas', 'SF Mono', 'Menlo', 'Liberation Mono',
+    ui-monospace, monospace;
+
+  /* 布局尺寸 */
+  --topbar-h: 64px;
+  --nav-w: 0;
+  --content-max: 1320px;
+  --content-pad-x: var(--space-6);
+  --content-pad-y: var(--space-5);
+  --chat-sidebar: 256px;
+
+  /* 组件尺寸 */
+  --card-pad: var(--space-5);
+  --card-pad-sm: var(--space-4);
+  --panel-pad: var(--space-5);
+  --row-h: 40px;
+
+  /* 线宽：B 里线只用于卡片内部分隔，不再承担层级 */
+  --rule: 1px;
+  --rule-thick: 2px;
+
+  /* 动效 */
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * 层 2：semantic —— 亮色（B 的默认面：正文阅读与表格都在这套下设计）
+ * 对比度实测：text 18.9 / text-dim 6.4 / text-faint 5.3 / accent 6.29
+ * ------------------------------------------------------------------------- */
+:root,
+:root[theme-mode='light'] {
+  color-scheme: light;
+
+  --bg: var(--paper-100);
+  --bg-panel: var(--white);
+  --bg-panel-2: var(--paper-50);
+  --bg-elevated: var(--white);
+  --bg-inset: #f3f3f8;
+  --bg-inset-deep: var(--paper-200);
+
+  --border: var(--paper-250);
+  --border-strong: var(--paper-300);
+
+  --text: var(--paper-900);
+  --text-body: #3f3f49;
+  --text-dim: var(--paper-400);
+  --text-faint: var(--paper-350);
+
+  --accent: var(--indigo-600);
+  --accent-dim: var(--indigo-700);
+  --accent-soft: var(--indigo-50);
+  --accent-line: var(--indigo-200);
+  --on-accent: var(--white);
+  --on-accent-ink: var(--white);
+
+  --ok: var(--green-600);
+  --warn: var(--amber-700);
+  --err: var(--red-700);
+  --err-dim: var(--red-700);
+  --ok-soft: #e7f8f1;
+  --warn-soft: #fff4e8;
+  --err-soft: #feecf0;
+  --warn-line: var(--amber-600);
+
+  --page-gradient: var(--paper-100);
+
+  /* 双层柔影：第一层定边，第二层给体积 */
+  --shadow-1: 0 1px 2px rgba(17, 17, 20, 0.05);
+  --shadow-2: 0 1px 2px rgba(17, 17, 20, 0.04),
+    0 18px 40px -26px rgba(17, 17, 20, 0.35);
+  --shadow-3: 0 2px 6px rgba(17, 17, 20, 0.06),
+    0 28px 60px -30px rgba(17, 17, 20, 0.45);
+  --shadow-dialog: 0 24px 60px -20px rgba(17, 17, 20, 0.4);
+}
+
+/* ---------------------------------------------------------------------------
+ * 层 2：semantic —— 暗色
+ * 暗色下阴影几乎不可见，层级改用「卡片底色比页面底色略亮 + 1px 描边」表达，
+ * 这是与亮色不同的实现，不是亮度翻转。
+ * ------------------------------------------------------------------------- */
+:root[theme-mode='dark'] {
+  color-scheme: dark;
+
+  --bg: var(--grey-900);
+  --bg-panel: var(--grey-800);
+  --bg-panel-2: var(--grey-750);
+  --bg-elevated: var(--grey-750);
+  --bg-inset: var(--grey-850);
+  --bg-inset-deep: var(--grey-950);
+
+  --border: var(--grey-600);
+  --border-strong: var(--grey-500);
+
+  --text: var(--grey-100);
+  --text-body: var(--grey-200);
+  --text-dim: var(--grey-300);
+  --text-faint: #8b8b9c;
+
+  --accent: var(--indigo-400);
+  --accent-dim: var(--indigo-500);
+  --accent-soft: rgba(129, 140, 248, 0.14);
+  --accent-line: rgba(129, 140, 248, 0.45);
+  --on-accent: var(--grey-950);
+  --on-accent-ink: var(--grey-950);
+
+  --ok: var(--green-300);
+  --warn: var(--amber-300);
+  --err: var(--red-300);
+  --err-dim: var(--red-300);
+  --ok-soft: rgba(61, 214, 140, 0.12);
+  --warn-soft: rgba(240, 164, 74, 0.12);
+  --err-soft: rgba(255, 122, 138, 0.12);
+  --warn-line: var(--amber-300);
+
+  --page-gradient: var(--grey-900);
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.5),
+    0 18px 40px -28px rgba(0, 0, 0, 0.9);
+  --shadow-3: 0 2px 6px rgba(0, 0, 0, 0.6),
+    0 28px 60px -30px rgba(0, 0, 0, 0.95);
+  --shadow-dialog: 0 24px 60px -20px rgba(0, 0, 0, 0.85);
+}

@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 管理 EKIP Java 后端的 Spring Boot 依赖、编译、打包及测试插件。 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.springframework.boot</groupId>
+		<artifactId>spring-boot-starter-parent</artifactId>
+		<version>3.5.16</version>
+		<relativePath/> <!-- lookup parent from repository -->
+	</parent>
+	<groupId>com.pony</groupId>
+	<artifactId>knowledge-backend</artifactId>
+	<version>0.0.1-SNAPSHOT</version>
+	<name>knowledge-platform</name>
+	<description>企业智能知识管理平台 - 后端</description>
+
+	<properties>
+		<java.version>17</java.version>
+	</properties>
+
+	<dependencies>
+		<!-- Web MVC -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-web</artifactId>
+		</dependency>
+
+        <!-- Only the circuit-breaker core; transport fault classification remains in this module. -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-circuitbreaker</artifactId>
+            <version>2.2.0</version>
+        </dependency>
+
+		<!-- 参数校验 -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-validation</artifactId>
+		</dependency>
+
+		<!-- Redis：Agent 记忆与产品会话、RAG 会话的唯一运行存储，
+		     登录限流计数（security/LoginThrottle，始终启用；Redis 不可用时降级为不限流 + log.error） -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-data-redis</artifactId>
+		</dependency>
+
+		<!-- MyBatis Plus（注意：是 com.baomidou，不是 mybatis-spring-boot-starter） -->
+		<dependency>
+			<groupId>com.baomidou</groupId>
+			<artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+			<version>3.5.7</version>
+		</dependency>
+
+		<!-- PostgreSQL 驱动（唯一数据源：业务表 + document_chunk 向量，PG 17 + pgvector） -->
+		<dependency>
+			<groupId>org.postgresql</groupId>
+			<artifactId>postgresql</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+
+		<!-- Flyway：schema 版本管理（docker/init/*.sql 已退役，db/migration 成为唯一权威） -->
+		<dependency>
+			<groupId>org.flywaydb</groupId>
+			<artifactId>flyway-core</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.flywaydb</groupId>
+			<artifactId>flyway-database-postgresql</artifactId>
+		</dependency>
+
+		<!-- Lombok -->
+		<dependency>
+			<groupId>org.projectlombok</groupId>
+			<artifactId>lombok</artifactId>
+			<optional>true</optional>
+		</dependency>
+
+		<!-- 测试 -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+		<!--
+		  SimpleTracer（io.micrometer.tracing.test.simple）：RagStageTracerTest 需要一个**真实** Tracer
+		  验证 observe() 内部留有活跃 span（缺 .start() 的回归只有真实 tracer 能抓到）。
+		  用它而不是某个桥的 tracer，测试就不必随 production 桥的更换再改写一次。
+		-->
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-tracing-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+		<!-- BCrypt（starter 已传递提供 spring-security-core，勿再显式钉老版本） -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-security</artifactId>
+		</dependency>
+
+		<!-- Observability：Actuator + Micrometer Tracing（日志 MDC）+ Prometheus 指标端点 -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+		<!-- Micrometer 的 OTel 桥保留产品 Trace 和日志关联；外部 OTLP 导出默认关闭，
+		     仅可选观测 Compose 显式启用。不能同时装配 Brave 与 OTel 两套 Tracer。 -->
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-tracing-bridge-otel</artifactId>
+		</dependency>
+		<!-- OTLP/HTTP 导出器；版本由 spring-boot-dependencies 的 opentelemetry-bom 管理 -->
+		<dependency>
+			<groupId>io.opentelemetry</groupId>
+			<artifactId>opentelemetry-exporter-otlp</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-registry-prometheus</artifactId>
+		</dependency>
+
+		<dependency>
+			<groupId>io.jsonwebtoken</groupId>
+			<artifactId>jjwt-api</artifactId>
+			<version>0.11.5</version>
+		</dependency>
+
+		<!-- JWT工具 -->
+		<dependency>
+			<groupId>io.jsonwebtoken</groupId>
+			<artifactId>jjwt-impl</artifactId>
+			<version>0.11.5</version>
+		</dependency>
+
+		<dependency>
+			<groupId>io.jsonwebtoken</groupId>
+			<artifactId>jjwt-jackson</artifactId>
+			<version>0.11.5</version>
+		</dependency>
+
+		<!-- MinIO -->
+		<dependency>
+			<groupId>io.minio</groupId>
+			<artifactId>minio</artifactId>
+			<version>8.5.17</version>
+		</dependency>
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-core</artifactId>
+            <version>3.5.7</version>
+        </dependency>
+        <dependency>
+            <groupId>antlr</groupId>
+            <artifactId>antlr</artifactId>
+            <version>2.7.7</version>
+        </dependency>
+
+        <!-- 2026-09-26：Milvus Java SDK（io.milvus:milvus-sdk-java:2.4.5）依赖已删除。
+             向量检索运行时只有 PG 内 halfvec(2560)+HNSW（PgVectorStore）；Milvus 副本退役为
+             离线工具（ai/migrate_pg_to_milvus.py 走 Python pymilvus，eval/probe_engine_parity.py 同），
+             不再需要 JVM 侧 SDK。退役依据见 eval/reports/engine_parity_probe_20260916_193627.txt。 -->
+
+        <!-- MCP Java SDK 0.18.4（对外暴露 MCP Server；选型证据见
+             docs/superpowers/specs/2026-09-09-mcp-server-design.md §3）。
+             不引入 Spring AI：其 2.0.x starter 依赖 Boot 4 / spring-webmvc 7。
+             - mcp-core：协议 + McpServer/McpClient（自带 reactor-core 3.7.0，由 Boot reactor-bom 接管；
+               不会启用 WebFlux，web 应用类型仍由 spring-boot-starter-web 决定）
+             - mcp-spring-webmvc：Streamable HTTP 服务端传输（依赖 spring-webmvc 6.2.1，兼容 Boot 3.5.16）
+             - mcp-json-jackson2：必需。mcp-core 刻意不绑定 JSON 库，McpServer/McpSyncServer 构建时
+               经 ServiceLoader 查找 McpJsonMapperSupplier + JsonSchemaValidatorSupplier，
+               无提供方则启动即抛 ServiceConfigurationError。其请求的 jackson 2.20.1 由 Boot 托管为 2.21.4。 -->
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-core</artifactId>
+            <version>0.18.4</version>
+        </dependency>
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-spring-webmvc</artifactId>
+            <version>0.18.4</version>
+        </dependency>
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-json-jackson2</artifactId>
+            <version>0.18.4</version>
+        </dependency>
+
+    </dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.springframework.boot</groupId>
+				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<excludes>
+						<exclude>
+							<groupId>org.projectlombok</groupId>
+							<artifactId>lombok</artifactId>
+						</exclude>
+					</excludes>
+				</configuration>
+			</plugin>
+
+			<!-- JwtUtil 构造期校验 jwt.secret 非空且原始 UTF-8 字节数 >= 32，而所有 @SpringBootTest
+			     都会装配 JwtUtil，故测试必须能拿到一个密钥。
+			     不新建 src/test/resources/application.yml：它会在 classpath 上完全遮蔽主 application.yml
+			     （不是合并），数据源 / mybatis-plus / ai 客户端配置会全部丢失。
+			     改用系统属性注入同一个 ${JWT_SECRET:} 占位符 —— Spring 解析占位符时先查系统属性再查环境变量。 -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<systemPropertyVariables>
+						<!-- ⚠️ 仅测试用的固定值，不是生产密钥，不要拿去部署 -->
+						<JWT_SECRET>test-only-jwt-secret-not-for-production-0123456789</JWT_SECRET>
+						<!-- 同上：内部鉴权令牌（2026-09-29 新增）的测试固定值。
+						     **必须与 ai/tests/conftest.py 的 TEST_INTERNAL_TOKEN 逐字一致** ——
+						     Python 侧测试用它、Java 侧集成测试也用它，两侧不同会让 Java 侧拿到 401。 -->
+						<INTERNAL_API_TOKEN>test-internal-token</INTERNAL_API_TOKEN>
+					</systemPropertyVariables>
+				</configuration>
+			</plugin>
+		</plugins>
+	</build>
+
+</project>

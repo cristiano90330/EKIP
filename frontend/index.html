@@ -1,0 +1,41 @@
+<!-- 前端文档入口，提供 Vue 挂载节点并加载应用启动模块。 -->
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EKIP 知识平台</title>
+    <!--
+      首屏预置主题：必须在样式表生效前设置 theme-mode，否则亮色系统下会先闪一帧暗色。
+      与 src/theme.ts 的 initTheme() 等价（同一个 localStorage 键 ekip-theme），
+      两处任何一处改动都要同步另一处。
+    -->
+    <script>
+      (function () {
+        var mode = ''
+        try {
+          var stored = window.localStorage.getItem('ekip-theme')
+          if (stored === 'light' || stored === 'dark') mode = stored
+        } catch (e) {
+          /* localStorage 不可用（隐私模式）时按系统偏好 */
+        }
+        if (!mode) {
+          mode = 'light'
+          try {
+            if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+              mode = 'dark'
+            }
+          } catch (e) {
+            /* matchMedia 不可用时按亮色（B 版为亮色优先） */
+          }
+        }
+        document.documentElement.setAttribute('theme-mode', mode)
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

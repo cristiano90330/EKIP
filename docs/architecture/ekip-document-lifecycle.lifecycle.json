@@ -1,0 +1,283 @@
+{
+    "schema_version":  1,
+    "diagram_type":  "lifecycle",
+    "meta":  {
+                 "title":  "文档解析任务生命周期 · 状态机与重试",
+                 "locale":  "zh-CN",
+                 "output":  "docs/architecture/ekip-document-lifecycle.html",
+                 "quality_profile":  "showcase",
+                 "viewBox":  [
+                                 980,
+                                 566
+                             ],
+                 "views":  [
+                               {
+                                   "id":  "main-path",
+                                   "label":  "处理主流程",
+                                   "focus":  [
+                                                 "uploaded",
+                                                 "queued",
+                                                 "processing",
+                                                 "vectorizing",
+                                                 "completed"
+                                             ],
+                                   "note":  "上传回执 → 提交后投递 → 解析 → 向量化与 chunk 替换 → 终态提交。"
+                               },
+                               {
+                                   "id":  "retry",
+                                   "label":  "等待与重试",
+                                   "focus":  [
+                                                 "processing",
+                                                 "waiting",
+                                                 "failed"
+                                             ],
+                                   "note":  "瞬态故障进入 WAITING 退避，重试/恢复扫描后重新执行；默认最多 3 次引擎尝试，退避 5s/10s。"
+                               },
+                               {
+                                   "id":  "terminal",
+                                   "label":  "终态与删除",
+                                   "focus":  [
+                                                 "waiting",
+                                                 "failed",
+                                                 "completed",
+                                                 "deleted"
+                                             ],
+                                   "note":  "重试耗尽或非瞬态故障进入 FAILED；删除先提交数据库再清理 MinIO。"
+                               }
+                           ]
+             },
+    "lanes":  [
+                  {
+                      "id":  "main",
+                      "label":  "处理主流程"
+                  },
+                  {
+                      "id":  "waiting",
+                      "label":  "等待与重试"
+                  },
+                  {
+                      "id":  "terminal",
+                      "label":  "终态"
+                  }
+              ],
+    "states":  [
+                   {
+                       "id":  "uploaded",
+                       "type":  "start",
+                       "label":  "上传并回执",
+                       "sublabel":  "Idempotency-Key 幂等",
+                       "tag":  "上传",
+                       "lane":  "main",
+                       "col":  0,
+                       "step":  "01"
+                   },
+                   {
+                       "id":  "queued",
+                       "type":  "active",
+                       "label":  "QUEUED",
+                       "sublabel":  "提交后投递任务",
+                       "tag":  "排队",
+                       "lane":  "main",
+                       "col":  1,
+                       "step":  "02"
+                   },
+                   {
+                       "id":  "processing",
+                       "type":  "active",
+                       "label":  "PROCESSING",
+                       "sublabel":  "下载 · 解析 · 切 chunk",
+                       "tag":  "执行",
+                       "lane":  "main",
+                       "col":  2,
+                       "step":  "03"
+                   },
+                   {
+                       "id":  "vectorizing",
+                       "type":  "active",
+                       "label":  "向量化与替换",
+                       "sublabel":  "Embedding 后 replaceChunks",
+                       "tag":  "锁 document",
+                       "lane":  "main",
+                       "col":  3,
+                       "step":  "04"
+                   },
+                   {
+                       "id":  "completed",
+                       "type":  "success",
+                       "label":  "COMPLETED",
+                       "sublabel":  "终态提交后发 SSE",
+                       "tag":  "完成",
+                       "lane":  "main",
+                       "col":  4,
+                       "step":  "05"
+                   },
+                   {
+                       "id":  "waiting",
+                       "type":  "waiting",
+                       "label":  "WAITING",
+                       "sublabel":  "退避 5s / 10s，最多 3 次",
+                       "tag":  "可重试",
+                       "lane":  "waiting",
+                       "col":  0
+                   },
+                   {
+                       "id":  "failed",
+                       "type":  "failure",
+                       "label":  "FAILED",
+                       "sublabel":  "非瞬态故障或重试耗尽",
+                       "tag":  "终态",
+                       "lane":  "terminal",
+                       "col":  0,
+                       "yOffset":  -75
+                   },
+                   {
+                       "id":  "deleted",
+                       "type":  "neutral",
+                       "label":  "DELETED",
+                       "sublabel":  "先提交 DB，再删 MinIO",
+                       "tag":  "终态",
+                       "lane":  "terminal",
+                       "col":  1,
+                       "yOffset":  -75
+                   }
+               ],
+    "transitions":  [
+                        {
+                            "id":  "enqueue",
+                            "from":  "uploaded",
+                            "to":  "queued",
+                            "label":  "提交后投递",
+                            "variant":  "default",
+                            "labelAt":  [
+                                            171,
+                                            205
+                                        ]
+                        },
+                        {
+                            "id":  "dispatch",
+                            "from":  "queued",
+                            "to":  "processing",
+                            "label":  "认领",
+                            "variant":  "default",
+                            "labelAt":  [
+                                            290,
+                                            205
+                                        ]
+                        },
+                        {
+                            "id":  "parse",
+                            "from":  "processing",
+                            "to":  "vectorizing",
+                            "label":  "解析成功",
+                            "variant":  "default",
+                            "labelAt":  [
+                                            437,
+                                            205
+                                        ]
+                        },
+                        {
+                            "id":  "complete",
+                            "from":  "vectorizing",
+                            "to":  "completed",
+                            "label":  "终态提交",
+                            "variant":  "emphasis",
+                            "labelAt":  [
+                                            745,
+                                            205
+                                        ]
+                        },
+                        {
+                            "id":  "transient-failure",
+                            "from":  "processing",
+                            "to":  "waiting",
+                            "label":  "瞬态故障",
+                            "variant":  "security",
+                            "route":  "drop",
+                            "labelAt":  [
+                                            440,
+                                            252
+                                        ]
+                        },
+                        {
+                            "id":  "requeue",
+                            "from":  "waiting",
+                            "to":  "processing",
+                            "label":  "退避后重试 / 恢复扫描",
+                            "variant":  "emphasis",
+                            "fromSide":  "left",
+                            "toSide":  "left",
+                            "via":  [
+                                        [
+                                            323,
+                                            307
+                                        ],
+                                        [
+                                            323,
+                                            157
+                                        ]
+                                    ],
+                            "labelAt":  [
+                                            340,
+                                            228
+                                        ]
+                        },
+                        {
+                            "id":  "retry-exhausted",
+                            "from":  "waiting",
+                            "to":  "failed",
+                            "label":  "重试耗尽",
+                            "variant":  "security",
+                            "route":  "drop",
+                            "labelAt":  [
+                                            448,
+                                            356
+                                        ]
+                        },
+                        {
+                            "id":  "fatal-failure",
+                            "from":  "processing",
+                            "to":  "failed",
+                            "label":  "非瞬态故障",
+                            "variant":  "security",
+                            "fromSide":  "right",
+                            "toSide":  "right",
+                            "via":  [
+                                        [
+                                            481,
+                                            157
+                                        ],
+                                        [
+                                            481,
+                                            404
+                                        ]
+                                    ],
+                            "labelAt":  [
+                                            530,
+                                            280
+                                        ]
+                        },
+                        {
+                            "id":  "user-delete",
+                            "from":  "completed",
+                            "to":  "deleted",
+                            "label":  "用户删除",
+                            "variant":  "default",
+                            "fromSide":  "bottom",
+                            "toSide":  "bottom",
+                            "via":  [
+                                        [
+                                            710,
+                                            470
+                                        ],
+                                        [
+                                            556,
+                                            470
+                                        ]
+                                    ],
+                            "labelAt":  [
+                                            710,
+                                            430
+                                        ]
+                        }
+                    ]
+}

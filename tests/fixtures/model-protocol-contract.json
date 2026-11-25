@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "stage": "S2",
+  "supportedProtocols": ["openai_chat", "openai_embedding", "cohere_rerank", "dashscope_rerank"],
+  "retiredProtocols": ["ollama_chat", "ollama_embedding"],
+  "agentToolEncoding": "native_tool_calls",
+  "toolArguments": "json_string",
+  "automaticMigration": false
+}

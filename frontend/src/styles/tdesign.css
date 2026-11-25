@@ -1,0 +1,261 @@
+/** 将 TDesign 组件样式接入产品的主题变量与全局视觉规则。 */
+
+/* ============================================================================
+ * TDesign 桥接层：把组件库的视觉身份换成 Bento，行为保持不变。
+ *
+ * 变量优先：圆角、阴影、底色、文字、品牌阶全部由 --td-* 驱动；
+ * 类名覆盖只用于「变量表达不了」的地方：输入框填充态、表格圆角、标签胶囊。
+ * ========================================================================== */
+
+:root[theme-mode='light'] {
+  --td-bg-color-page: var(--bg);
+  --td-bg-color-container: var(--bg-panel);
+  --td-bg-color-container-hover: #f7f7fb;
+  --td-bg-color-container-active: #f0f0f6;
+  --td-bg-color-container-select: #eef0ff;
+  --td-bg-color-secondarycontainer: #f3f3f8;
+  --td-bg-color-secondarycontainer-hover: #ececf3;
+  --td-bg-color-secondarycontainer-active: #e5e5ee;
+
+  --td-bg-color-component: #f3f3f8;
+  --td-bg-color-component-hover: #ececf3;
+  --td-bg-color-component-active: #e5e5ee;
+  --td-bg-color-component-disabled: #f6f6f9;
+  --td-bg-color-secondarycomponent: #f3f3f8;
+  --td-bg-color-secondarycomponent-hover: #ececf3;
+  --td-bg-color-secondarycomponent-active: #e5e5ee;
+
+  --td-border-level-1-color: var(--border);
+  --td-border-level-2-color: var(--border-strong);
+  --td-text-color-primary: var(--text);
+  --td-text-color-secondary: var(--text-dim);
+  --td-text-color-placeholder: var(--text-faint);
+  --td-text-color-disabled: rgba(17, 17, 20, 0.28);
+  --td-text-color-brand: var(--accent);
+  --td-text-color-link: var(--accent);
+
+  /* 圆角：控件 12px、容器 20px、胶囊 999px */
+  --td-radius-small: 6px;
+  --td-radius-default: 12px;
+  --td-radius-medium: 12px;
+  --td-radius-large: 16px;
+  --td-radius-extraLarge: 20px;
+  --td-radius-round: 999px;
+  --td-radius-circle: 50%;
+
+  --td-shadow-1: var(--shadow-1);
+  --td-shadow-2: var(--shadow-2);
+  --td-shadow-3: var(--shadow-3);
+
+  --td-font-family: var(--font-sans);
+
+  /* 品牌阶：靛蓝 */
+  --td-brand-color-1: #eef0ff;
+  --td-brand-color-2: #e0e3ff;
+  --td-brand-color-3: #c7d2fe;
+  --td-brand-color-4: #a5b4fc;
+  --td-brand-color-5: #818cf8;
+  --td-brand-color-6: #6366f1;
+  --td-brand-color-7: #4f46e5;
+  --td-brand-color-8: #4338ca;
+  --td-brand-color-9: #362f96;
+  --td-brand-color-10: #29246b;
+  --td-brand-color: var(--td-brand-color-7);
+  --td-brand-color-hover: var(--td-brand-color-8);
+  --td-brand-color-active: var(--td-brand-color-9);
+  --td-brand-color-focus: var(--td-brand-color-3);
+  --td-brand-color-disabled: var(--td-brand-color-3);
+  --td-brand-color-light: #eef0ff;
+  --td-brand-color-light-hover: #e0e3ff;
+
+  --td-success-color: var(--green-600);
+  --td-warning-color: var(--amber-700);
+  --td-error-color: var(--red-700);
+}
+
+:root[theme-mode='dark'] {
+  --td-bg-color-page: var(--bg);
+  --td-bg-color-container: var(--bg-panel);
+  --td-bg-color-container-hover: #1b1b24;
+  --td-bg-color-container-active: #20202b;
+  --td-bg-color-container-select: #21212e;
+  --td-bg-color-secondarycontainer: #1b1b24;
+  --td-bg-color-secondarycontainer-hover: #20202b;
+  --td-bg-color-secondarycontainer-active: #262633;
+
+  --td-bg-color-component: #101016;
+  --td-bg-color-component-hover: #1b1b24;
+  --td-bg-color-component-active: #20202b;
+  --td-bg-color-component-disabled: #131319;
+  --td-bg-color-secondarycomponent: #1b1b24;
+  --td-bg-color-secondarycomponent-hover: #20202b;
+  --td-bg-color-secondarycomponent-active: #262633;
+
+  --td-border-level-1-color: var(--border);
+  --td-border-level-2-color: var(--border-strong);
+  --td-text-color-primary: var(--text);
+  --td-text-color-secondary: var(--text-dim);
+  --td-text-color-placeholder: var(--text-faint);
+  --td-text-color-disabled: rgba(241, 241, 246, 0.3);
+  --td-text-color-brand: var(--accent);
+  --td-text-color-link: var(--accent);
+
+  --td-radius-small: 6px;
+  --td-radius-default: 12px;
+  --td-radius-medium: 12px;
+  --td-radius-large: 16px;
+  --td-radius-extraLarge: 20px;
+  --td-radius-round: 999px;
+  --td-radius-circle: 50%;
+
+  --td-shadow-1: var(--shadow-1);
+  --td-shadow-2: var(--shadow-2);
+  --td-shadow-3: var(--shadow-3);
+
+  --td-font-family: var(--font-sans);
+
+  /* 暗色下主色提亮到 400/300 档，保证在 #15151c 卡片上可读 */
+  --td-brand-color-1: #1c1b3a;
+  --td-brand-color-2: #241f52;
+  --td-brand-color-3: #2f2874;
+  --td-brand-color-4: #3b3299;
+  --td-brand-color-5: #4f46e5;
+  --td-brand-color-6: #6366f1;
+  --td-brand-color-7: #818cf8;
+  --td-brand-color-8: #a5b4fc;
+  --td-brand-color-9: #c7d2fe;
+  --td-brand-color-10: #e8eaff;
+  --td-brand-color: var(--td-brand-color-7);
+  --td-brand-color-hover: var(--td-brand-color-8);
+  --td-brand-color-active: var(--td-brand-color-9);
+  --td-brand-color-focus: var(--td-brand-color-5);
+  --td-brand-color-disabled: var(--td-brand-color-5);
+  --td-brand-color-light: rgba(129, 140, 248, 0.14);
+  --td-brand-color-light-hover: rgba(129, 140, 248, 0.22);
+
+  --td-success-color: var(--green-300);
+  --td-warning-color: var(--amber-300);
+  --td-error-color: var(--red-300);
+}
+
+/* ---------- 按钮 ---------- */
+.t-button {
+  font-weight: var(--fw-medium);
+  letter-spacing: 0;
+}
+
+.t-button--variant-base.t-button--theme-primary:not(.t-button--disabled),
+.t-button--variant-base.t-button--theme-primary:not(.t-button--disabled):hover,
+.t-button--variant-base.t-button--theme-primary:not(.t-button--disabled):active,
+.t-button--variant-base.t-button--theme-primary:not(.t-button--disabled):focus {
+  color: var(--on-accent-ink);
+}
+
+/* 主按钮加一档柔影，让它在白卡上有体积 */
+.t-button--variant-base.t-button--theme-primary:not(.t-button--disabled) {
+  box-shadow: var(--shadow-1);
+}
+
+.t-button--variant-outline {
+  border-color: var(--border-strong);
+}
+
+/* ---------- 输入类 ---------- */
+.t-input,
+.t-textarea__inner,
+.t-select .t-input {
+  border-radius: var(--td-radius-default);
+}
+
+.t-input:hover,
+.t-textarea__inner:hover {
+  border-color: var(--border-strong);
+}
+
+.t-input.t-is-focused,
+.t-textarea__inner:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* ---------- 表格：卡片圆角，表头不着色 ---------- */
+.t-table {
+  border-radius: var(--radius-lg);
+}
+
+.t-table__content,
+.t-table--bordered {
+  border-radius: inherit;
+}
+
+.t-table th {
+  background: var(--bg-panel-2);
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semi);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.t-table td {
+  color: var(--text-body);
+}
+
+.t-table tbody tr:hover td {
+  background: var(--bg-panel-2);
+}
+
+/* ---------- 标签：胶囊 ---------- */
+.t-tag {
+  border-radius: var(--radius-full);
+  font-weight: var(--fw-medium);
+}
+
+/* ---------- 弹层 ---------- */
+.t-dialog,
+.t-drawer {
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-dialog);
+}
+
+.t-dialog__mask,
+.t-drawer__mask {
+  background: rgba(17, 17, 20, 0.42);
+}
+
+:root[theme-mode='dark'] .t-dialog__mask,
+:root[theme-mode='dark'] .t-drawer__mask {
+  background: rgba(0, 0, 0, 0.7);
+}
+
+.t-popup,
+.t-select__dropdown {
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-3);
+  overflow: hidden;
+}
+
+/* ---------- 折叠面板：去边框，用内嵌底色 ---------- */
+.t-collapse {
+  border: 0;
+  background: transparent;
+}
+
+.t-collapse-panel__header {
+  border-radius: var(--radius-md);
+}
+
+/* ---------- 单选组：胶囊分段 ---------- */
+.t-radio-group.t-radio-group--filled {
+  border-radius: var(--radius-full);
+  padding: 2px;
+}
+
+.t-radio-group.t-radio-group--filled .t-radio-button {
+  border-radius: var(--radius-full);
+}
+
+.t-radio-group.t-radio-group--filled .t-radio-button.t-is-checked {
+  box-shadow: var(--shadow-1);
+}

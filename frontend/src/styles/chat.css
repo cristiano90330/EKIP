@@ -1,0 +1,604 @@
+/** 提供问答和 Agent 聊天页共用的输入区、消息、来源和移动端布局。 */
+
+/* ============================================================================
+ * 聊天界面共用样式：AskView 与 AgentView 逐字符重复的规则收在这里。
+ *
+ * B 版形态：会话栏与对话区各是一张白卡（20px 圆角 + 柔影），页面底色是 #F5F5F7；
+ * 答案不再装进描边气泡，直接排在卡片里，用户提问用浅灰胶囊气泡。
+ *
+ * 全部选择器都挂在 .chat-page 下 —— 两个页面虽然各自 scoped，
+ * 但结构必须一致，任何一侧单独改都会漂移。
+ * ========================================================================== */
+
+/* ---------- 页面骨架 ---------- */
+.chat-page {
+  display: flex;
+  gap: var(--space-4);
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xl);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+}
+
+:root[theme-mode='dark'] .chat-main {
+  border-color: var(--border);
+  box-shadow: var(--shadow-1);
+}
+
+/* 卡片内的页头：压成一行，不与页面级标题争层级 */
+.chat-main .page-head {
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-4) var(--space-5) var(--space-3);
+}
+
+.chat-main .page-head h1 {
+  font-size: var(--fs-lg);
+  letter-spacing: -0.01em;
+}
+
+.chat-main .page-head p {
+  margin-top: 2px;
+  font-size: var(--fs-sm);
+}
+
+.chat-page .conv-sidebar,
+.chat-page .agent-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: none;
+  width: var(--chat-sidebar);
+  min-height: 0;
+  padding: var(--space-4);
+  border: 1px solid transparent;
+  border-radius: var(--radius-xl);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-2);
+}
+
+:root[theme-mode='dark'] .chat-page .conv-sidebar,
+:root[theme-mode='dark'] .chat-page .agent-sidebar {
+  border-color: var(--border);
+  box-shadow: var(--shadow-1);
+}
+
+.chat-page .new-conv-btn {
+  flex: none;
+}
+
+.chat-page .conv-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: 100%;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
+}
+
+.chat-page .conv-history-head h2 {
+  margin: 0;
+  font-size: var(--fs-sm);
+}
+
+.chat-page .conv-list {
+  display: flex;
+  /* 不抢剩余空间：列表只占内容高度，会话少时不会把「更多会话」推到底部；
+     内容超出侧栏时才收缩并滚动。 */
+  flex: 0 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.chat-page .conv-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-md);
+  color: var(--text-dim);
+  transition: background var(--dur-base) var(--ease-out),
+    color var(--dur-base) var(--ease-out);
+}
+
+.chat-page .conv-item:hover {
+  background: var(--bg-panel-2);
+  color: var(--text);
+}
+
+.chat-page .conv-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: var(--fw-semi);
+}
+
+.chat-page .conv-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--fs-base);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-page .conv-open {
+  border: 0;
+  padding: 5px 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-page .conv-delete {
+  flex: none;
+  color: var(--text-dim);
+}
+
+.chat-page .conv-delete:hover,
+.chat-page .conv-delete:focus-visible,
+.chat-page .conv-error {
+  color: var(--err);
+}
+
+.chat-page .conv-foot {
+  /* 列表改为自然高度后，用自动外边距把说明压到栏底，空白集中在说明上方而不是按钮上方 */
+  margin: auto 0 0;
+  color: var(--text-faint);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+}
+
+/* ---------- 消息流 ---------- */
+.chat-page .messages {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+  min-height: 0;
+  padding: var(--space-2) var(--space-5) var(--space-3);
+  overflow: auto;
+  overscroll-behavior-y: contain;
+}
+
+.chat-page .chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 560px;
+  margin: auto;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.chat-page .chat-empty p {
+  margin: 6px 0 0;
+  color: var(--text);
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-bold);
+  letter-spacing: -0.02em;
+}
+
+.chat-page .chat-empty > span {
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+}
+
+.chat-page .welcome-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-lg);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 20px;
+}
+
+.chat-page .sample-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.chat-page .sample-chip {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  padding: 7px 14px;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.chat-page .sample-chip:hover {
+  border-color: var(--accent-line);
+  box-shadow: var(--shadow-1);
+  color: var(--accent);
+}
+
+/* ---------- 气泡 ---------- */
+.chat-page .msg-row {
+  display: flex;
+  min-width: 0;
+}
+
+.chat-page .msg-row.user {
+  justify-content: flex-end;
+}
+
+.chat-page .msg-row.assistant {
+  justify-content: stretch;
+}
+
+.chat-page .bubble {
+  max-width: 88%;
+  border-radius: var(--radius-lg);
+  padding: 11px 15px;
+  line-height: var(--lh-read);
+  word-break: break-word;
+}
+
+.chat-page .user-bubble {
+  border-bottom-right-radius: var(--radius-xs);
+  background: var(--bg-inset);
+  color: var(--text);
+  font-size: var(--fs-md);
+  white-space: pre-wrap;
+}
+
+/* 助手回答不再套描边气泡：直接排在卡片里，限制阅读宽度 */
+.chat-page .ai-bubble {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: min(100%, 980px);
+  padding: 0;
+  background: transparent;
+}
+
+.chat-page .loading-state,
+.chat-page .run-state {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+
+.chat-page .loading-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: chat-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes chat-pulse {
+  50% {
+    opacity: 0.4;
+    transform: scale(0.8);
+  }
+}
+
+.chat-page .msg-alert {
+  text-align: left;
+}
+
+.chat-page .error-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-page .meta-line,
+.chat-page .request-id {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-micro);
+  opacity: 0.85;
+}
+
+/* ---------- 答案正文 ---------- */
+.chat-page .answer-text {
+  margin: 0;
+  color: var(--text-body);
+  font-size: var(--fs-read);
+  line-height: var(--lh-read);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-page .typing-caret {
+  display: inline-block;
+  width: 2px;
+  height: 15px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: var(--accent);
+  animation: chat-caret 1s steps(1) infinite;
+}
+
+@keyframes chat-caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* ---------- 参考来源 ---------- */
+.chat-page .sources-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.chat-page .sources-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semi);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.chat-page .source-count {
+  display: grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semi);
+  letter-spacing: 0;
+}
+
+.chat-page .source-collapse {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.chat-page .source-collapse .t-collapse-panel {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-1);
+}
+
+.chat-page .source-collapse .t-collapse-panel--disabled {
+  background: var(--bg-panel);
+}
+
+.chat-page .source-collapse .t-collapse-panel__header {
+  padding: 10px 12px;
+}
+
+.chat-page .source-header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  width: 100%;
+  padding-right: var(--space-1);
+}
+
+.chat-page .source-index {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: var(--radius-xs);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: var(--fw-bold);
+}
+
+.chat-page .source-titles {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.chat-page .source-titles strong {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semi);
+}
+
+.chat-page .source-titles small {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+}
+
+.chat-page .source-score {
+  flex: none;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-page .source-content {
+  margin: 0;
+  padding: var(--space-2) var(--space-3) var(--space-3) calc(20px + var(--space-3));
+  color: var(--text-body);
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-page .no-sources {
+  margin: 0;
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-inset);
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+
+.chat-page .exec-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  color: var(--text-faint);
+  font-size: var(--fs-sm);
+}
+
+.chat-page .exec-summary strong {
+  margin-left: 6px;
+  color: var(--text);
+  font-weight: var(--fw-semi);
+}
+
+/* ---------- 底部输入区 ---------- */
+.chat-page .composer {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0 var(--space-5) var(--space-5);
+  padding: var(--space-3) var(--space-3) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel-2);
+}
+
+/* 原生 textarea 有默认 cols 带来的最小宽度，窄列里必须允许收缩 */
+.chat-page .composer .t-textarea,
+.chat-page .composer .t-textarea__inner,
+.chat-page .composer textarea {
+  width: 100%;
+  min-width: 0;
+}
+
+.chat-page .composer .t-textarea__inner {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* 字数上限指示：组件默认 14px 落在输入框右下角，与正文同级、比提示语更抢眼。
+   收到 micro 档并压到次级色，只作为边缘信息存在。 */
+.chat-page .composer .t-textarea__limit {
+  color: var(--text-faint);
+  font-size: var(--fs-micro);
+  line-height: 1;
+}
+
+.chat-page .composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.chat-page .shortcut-hint {
+  font-size: var(--fs-micro);
+}
+
+/* ---------- 窄屏：会话栏转顶部横条 ---------- */
+@media (max-width: 900px) {
+  .chat-page {
+    flex-direction: column;
+  }
+
+  .chat-page .conv-sidebar,
+  .chat-page .agent-sidebar {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    width: 100%;
+    max-height: 34%;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    overflow: auto;
+  }
+
+  .chat-page .new-conv-btn {
+    width: auto;
+  }
+
+  .chat-page .conv-list {
+    flex: 1 1 100%;
+    flex-direction: row;
+    gap: 6px;
+    overflow-x: auto;
+  }
+
+  .chat-page .conv-item {
+    flex: none;
+    max-width: 180px;
+  }
+
+  .chat-page .conv-foot {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .chat-page .bubble {
+    max-width: 94%;
+  }
+
+  .chat-page .messages {
+    padding: var(--space-2) var(--space-4) var(--space-3);
+  }
+
+  .chat-page .composer {
+    margin: 0 var(--space-4) var(--space-4);
+  }
+
+  .chat-page .source-content {
+    padding-left: var(--space-3);
+  }
+
+  .chat-page .composer-footer {
+    align-items: flex-end;
+  }
+}

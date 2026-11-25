@@ -1,0 +1,453 @@
+# 配置 Java 后端的数据源、认证、文档任务、模型执行、问答、Agent 和运维访问。
+
+# 业务数据、切片和向量共用 PostgreSQL，切片写入与任务收尾可在同一事务提交。
+spring:
+  application:
+    name: knowledge-platform
+
+  # ---------- 唯一数据源：PostgreSQL 17 + pgvector（业务表 + document_chunk） ----------
+  # 改造前是 MySQL（业务）+ PG（向量）双库，现已合并；DataSourceConfig.java 随之删除。
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:knowledge}
+    username: ${POSTGRES_USER:postgres}
+    password: ${POSTGRES_PASSWORD:123456}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 0
+      # 只抑制 Hikari 自己的启动期建池与校验，不等于「应用启动不需要 PG」：
+      #   Flyway（spring.flyway.enabled: true，见下方）在上下文刷新期就要连库
+      #   （FlywayMigrationInitializer.afterPropertiesSet → getConnection），
+      #   PG 没起时上下文加载会失败、进程 exit=1 —— 2026-09-16 实测。
+      #   原注释「启动不连库，避免 PG 未就绪时阻塞上下文加载」是 DataSourceConfig 时代的遗留，已不成立。
+      initialization-fail-timeout: -1
+      pool-name: ekip-hikari
+
+  # 向量检索查询超时（原 DataSourceConfig 读 PGVECTOR_QUERY_TIMEOUT_SECONDS，现改为标准配置项）
+  jdbc:
+    template:
+      query-timeout: 8s
+
+  # ---------- schema 版本管理 ----------
+  # db/migration 是唯一权威；docker/init/*.sql 已删除，容器不再挂载 init 目录。
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # 刻意【不】设 baseline-on-migrate（保持默认 false）：V1 是「一版建全表」的绿地 baseline。
+    # 开着它时，只要 public 非空且没有 flyway_schema_history，Flyway 会先写一条 v1 的
+    # baseline 记录、然后跳过 V1 本身 —— 迁移报告成功却一张表都没建，故障推迟到运行期
+    # 才以 relation "sys_user" does not exist 的形式爆出来。
+    # 绿地 baseline 要的是脏库「响亮地失败」，而不是静默兼容存量库。
+
+  # ---------- 文件上传上限（未配置时 Spring Boot 默认单文件 1MB / 单请求 10MB）----------
+  servlet:
+    multipart:
+      max-file-size: ${MULTIPART_MAX_FILE_SIZE:50MB}
+      max-request-size: ${MULTIPART_MAX_REQUEST_SIZE:60MB}
+
+  # ---------- Redis（MemoryStorage 用；spring-data-redis 自动配置读这里）----------
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # Redis 连接建立与命令读取都必须有硬上限，避免 /rag/chat 在依赖不可用时挂住。
+      connect-timeout: 1s
+      timeout: 2s
+
+server:
+  port: 8080
+  # 登录限流按「IP + 用户名」双维度分桶，IP 必须是真的客户端 IP。
+  # 前端走 Vite 代理、生产走 Nginx，request.getRemoteAddr() 拿到的是代理 IP →
+  # 所有用户共享一个 IP 桶 → (ip, username) 退化成 username → 任何人失败 5 次就锁死全站。
+  # native 让 Tomcat 的 RemoteIpValve 只在请求来自受信内网代理（127/8、10/8、192.168/16、172.16/12）
+  # 时才采纳 X-Forwarded-For；公网直连时忽略 XFF，攻击者无法靠伪造 XFF 轮换 IP 绕过。
+  # ⚠️ 部署前提：反向代理必须转发 X-Forwarded-For，否则本条配了也没用。
+  forward-headers-strategy: native
+
+# ---------- JWT（密钥外置，无默认值） ----------
+# secret 为空或原始 UTF-8 字节数 < 32 时 JwtUtil 构造期即抛 IllegalStateException（fail-fast），
+# 错误消息里带 openssl rand -base64 48 与「写入仓库根 .env」的可执行指令。
+# 按原始字节用密钥，不做 Base64 解码（与改造前同一用法，绕开 setSigningKey(String) 的 Base64 陷阱）。
+# ⚠️ 测试面：src/test/resources/application.yml 不存在且不要新建 —— 它会在 classpath 上完全遮蔽
+# 主 application.yml（数据源 / mybatis-plus / ai 客户端配置全丢）。测试密钥由 pom.xml 的
+# maven-surefire-plugin systemPropertyVariables 注入同一个占位符。
+jwt:
+  secret: ${JWT_SECRET:}
+  # 访问令牌短（默认 15 分钟）：无状态、每请求不查 Redis，泄露窗口由短命收敛。
+  access-expire-minutes: ${JWT_ACCESS_EXPIRE_MINUTES:15}
+  # 刷新令牌长（默认 7 天）：jti 存 Redis 可吊销，登出即删；票上带 sid，旧票被重放即清算整个会话（3.1 P2-16）。
+  refresh-expire-days: ${JWT_REFRESH_EXPIRE_DAYS:7}
+
+accounts:
+  admin-username: ${EKIP_ACCOUNT_ADMIN_USERNAME:}
+
+# ---------- 登录限流（关闭暴力破解 + BCrypt 的 CPU DoS 入口） ----------
+# 计数落在 Redis（login:fail:{username}:{ip}），键在首次失败时设 TTL、后续只累加不续期，
+# 避免攻击者靠持续失败把锁延长到永久。Redis 不可用时降级为「不限流」+ log.error（可用性优先，见设计 §11.4）。
+login:
+  throttle:
+    enabled: ${LOGIN_THROTTLE_ENABLED:true}
+    max-attempts: ${LOGIN_THROTTLE_MAX_ATTEMPTS:5}
+    lock-minutes: ${LOGIN_THROTTLE_LOCK_MINUTES:15}
+
+# ---------- 观测：Actuator / Tracing / Prometheus ----------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,loggers
+  tracing:
+    sampling:
+      probability: 1.0
+  # 外部追踪出口默认关闭；保留 Micrometer Tracer、产品 Trace、指标和日志关联。
+  # 完整 Compose 观测方案显式启用 OTEL_ENABLED，并指向 Collector。
+  otlp:
+    tracing:
+      export:
+        enabled: ${OTEL_ENABLED:false}
+      endpoint: ${OTEL_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+
+# Request ID 与 traceId 是两套标识：前者跨进程透传给 Python（X-Request-ID），
+# 后者由 Micrometer Tracing 写入 MDC。两者都进日志行，排障时按任一条都能关联。
+# ⚠️ 覆盖 logging.pattern.level 会**丢掉** Boot 默认 pattern 里的 traceId/spanId，
+#    所以必须在这里显式写回；缺了它 trace 虽然在导出，日志里却关联不上。
+logging:
+  pattern:
+    level: "%5p [requestId=%X{requestId:-} traceId=%X{traceId:-} spanId=%X{spanId:-}]"
+
+# MyBatis Plus 配置
+mybatis-plus:
+  configuration:
+    # 下划线转驼峰（数据库 user_name -> 实体 userName）
+    map-underscore-to-camel-case: true
+    # 枚举按 @EnumValue 标注的 code 与 int 列互转（Document.status）。
+    # MyBatis 默认处理器按「枚举名」映射，且手写 @Select 的自动映射也走这里，不指定就读不出 int 列
+    default-enum-type-handler: com.baomidou.mybatisplus.core.handlers.MybatisEnumTypeHandler
+    # 开发期打印 SQL，方便排查。默认关闭：StdOutImpl 会把每条 SQL 连同参数打到 stdout，
+    # 生产环境既噪音大又泄露数据内容。需要时本地临时打开。
+    # log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    banner: false
+    db-config:
+      # 后面加逻辑删除字段时启用，先留着
+      # logic-delete-field: deleted
+      # logic-delete-value: 1
+      # logic-not-delete-value: 0
+      id-type: auto
+
+# MinIO 配置
+minio:
+  endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
+  access-key: ${MINIO_ACCESS_KEY:admin}
+  secret-key: ${MINIO_SECRET_KEY:12345678}
+  bucket-name: ${MINIO_BUCKET:knowledge-files}
+
+# ---------- 对象存储孤儿回收（第 01 章 3.1 P2-16）----------
+# 删文档选了「先删 DB、MinIO 失败只 log.error」（P1-6 的必需配套），代价是必然累积
+# 「DB 已无记录、文件还在 bucket」的孤儿对象。MinioReclaimService 定期列 bucket 与
+# document.file_path 对账后回收。四个值须与 MinioReclaimService 的 @Value 默认值一致。
+storage:
+  reclaim:
+    # 🔴 默认关闭：它每天删数据，开启必须是有意识的决定。
+    # ⚠️ 本任务没有 dry-run 档：enabled=false 时 reclaimOrphanObjects() 在方法开头直接 return、
+    #    连 bucket 都不列（只打一行 debug）；enabled=true 时算出孤儿立刻删。
+    #    所以「先看清单再决定」这两档都给不了——要预检请走只读对账：
+    #    `SELECT file_path FROM document` 与 bucket 清单（mc ls / boto3 list_objects）做 diff。
+    #    真正的 dry-run 档尚未实现。
+    enabled: ${STORAGE_RECLAIM_ENABLED:false}
+    # 宽限期：挡住「MinIO 已上传、document 行还没提交」的窗口，别调小于一次上传的最长耗时
+    grace-period-hours: ${STORAGE_RECLAIM_GRACE_HOURS:24}
+    # 每天一次；启动后延迟 5 分钟首跑，避开应用自身的启动恢复与预热
+    scan-interval-ms: ${STORAGE_RECLAIM_SCAN_MS:86400000}
+    initial-delay-ms: ${STORAGE_RECLAIM_INITIAL_DELAY_MS:300000}
+
+# ---------- 操作审计（audit_log）----------
+# 只增不改的追溯表，写入方唯一（com.pony.knowledge.audit.AuditLogService）。
+# 本项目不提供审计查询 API：单实例部署，直接 psql 查（示例 SQL 在 V12__audit_log.sql 末尾）。
+# 三个值须与 AuditLogRetention 的 @Value 默认值一致。
+audit:
+  retention:
+    # 保留天数；<= 0 表示**关闭清扫**（合规要求库外归档时用）。
+    # ⚠️ 关闭清扫不会停写，表会一直涨 —— 只是不再删。
+    days: ${AUDIT_RETENTION_DAYS:90}
+    # 每天一次；启动后延迟 10 分钟首跑，避开迁移与启动流量
+    scan-interval-ms: ${AUDIT_RETENTION_SCAN_MS:86400000}
+    initial-delay-ms: ${AUDIT_RETENTION_INITIAL_DELAY_MS:600000}
+
+# ---------- 检索技术路线（version 标签，评估结果用它做迭代对比） ----------
+# baseline → hybrid → hybrid-rerank → hybrid-rerank-rewrite
+# ⚠️ compression 不是第 5 档：它是正交轴（由下方 rag.compression.mode 单独开关，默认 none）。
+#    代码里 version 走 if-else 只认上面四档，配 version=compression 会静默落进 else 当 baseline 跑（06 章 3.1 P0-4）。
+retrieval:
+  version: hybrid-rerank-rewrite
+  # Rerank 前的召回规模 Top-N（> 最终 Top-K，给 Rerank 更多候选）
+  recall-n: 20
+  # RRF 融合常量 k：score = Σ 1/(k + rank)，key = documentId:chunkIndex。
+  # 与 Java `RetrievalService` 时代的硬编码 60 逐位相同（「重切边界」平移，不改行为）。
+  # 2026-09-30（评审 C-1「检索参数重审」）把它从 Python 模块常量改成**逐请求透传**的旋钮：
+  #   Python 侧 ai/app/retrieval/retriever.py 的 RRF_K 仍是"代码兜底值"，请求体会覆盖它。
+  #   这样评测矩阵可以按**实例**切档扫参数（run_eval.py --rrf-k），而不必重启常驻的 AI 服务。
+  # ⚠️ 改默认值必须先跑评测证据（见 docs/archive/执行计划-2026-09-30-C1-C2-检索参数重审与快速失败.md）：
+  #    当前基线 recall@k 已 = 1.000（顶天花板），调 k 只可能影响 precision@n / nDCG / 冗余度，
+  #    不会提升 recall —— 不要凭直觉调它。
+  rrf-k: 60
+
+# ---------- RAG 会话 / Query Rewrite / Context 压缩 ----------
+rag:
+  pipeline:
+    # Execution engine is independent from retrieval.version; individual requests may override it.
+    engine: ${RAG_PIPELINE_ENGINE:fixed}
+  query:
+    # Java 每次 /rag/query 都透传该预算；Python 从请求入口起按同一 deadline 扣减。
+    budget-ms: ${RAG_QUERY_DEADLINE_MS:270000}
+  # 查询路径只有一条（决策文档 §4 第 5 项「重切边界」）：Java 授权后一次调用 Python /rag/query，
+  # 整条管线（rewrite → 两路召回 → RRF → rerank → [MMR] → [extractive 压缩] → [small-to-big] → generate）
+  # 在 Python 内跑完。旧的 segmented 分段编排（Java 编排，5 次穿越）已删除，rag.query-mode 开关随之退役。
+  # 传给 Query Rewrite 的对话历史条数（user/assistant 各算 1 条）
+  history-window: 6
+  # 会话历史固定使用 Redis；测试替身不进入运行时装配。
+  # Context 压缩（3.4）：none / extractive（本地抽取）
+  # 切换后重启后端生效；对比压缩前后 Answer Quality/Faithfulness/Latency/Cost 时改这里、跑同一份评估数据集
+  # 06 章 3.1 P1-3（2026-09-19）：extractive 已从软预算改为硬预算（tokensAfter ≤ token-budget 保证），
+  # 但**默认仍保持 none**——冻结矩阵（baseline-v3.9）里 extractive 在默认档位把 correctness 从
+  # 0.834/0.980 拉到 0.784/0.750、multi faithfulness 1.000→0.940，省 token 却降答案质量；
+  # 只在 context 确有超长风险（长文档/长历史）时按场景打开。
+  # 🔴 2026-09-26 减法：`llm` 档（LlmContextCompressor → Python /context/compress）**已删除**。
+  # 实测证据：压缩阶段 16,385 ms + 52,293 token，correctness 0.8531 与 extractive **完全相同**，
+  # answerRelevance 反而更低（0.906 vs 0.956），总成本最高（$0.0107）。合法值只有 none / extractive；
+  # 填 llm 或任何未注册值会被 Python 侧 `postprocess.VALID_COMPRESSION_MODES` 响亮校验拒绝，
+  # 不再「静默不压缩」——那种失败会让评测报告标着 llm 实际按 none 跑，整份对比作废。
+  compression:
+    mode: none
+  # 压缩后上下文总 token 预算（近似：中文 1 字≈1 token）
+  token-budget: 1500
+  # ---------- MMR 去冗余（决策文档 §4 第 3 项）----------
+  # 在「重排后的候选池」里贪婪挑出「相关且不重复」的 Top-K（Jaccard 字符二元组，λ=0.7 对齐 WeKnora）。
+  # 只对 rerank 版本生效（score 是 0~1 相关度；RRF 分 ~0.016 量纲不同，故 hybrid 档不接 MMR）。
+  # 默认 false —— 默认行为与改造前逐字一致；开启需先跑评测确认精度/召回变化（见 run_eval 的 --mmr）。
+  mmr:
+    enabled: ${RAG_MMR_ENABLED:false}
+    lambda: ${RAG_MMR_LAMBDA:0.7}
+  # ---------- 父子块 small-to-big（决策文档 §4 第 3 项）----------
+  # 命中子块、回填父块：入库时把「同一标题节内相邻子块」打包成父块（source_type='parent'、无 embedding/search_vector），
+  # 生成侧回填父块内容（更完整上下文）、按父块去重。默认 false（不建父块）；开启后需**重新入库**已有文档才会生成父块。
+  small-to-big:
+    enabled: ${RAG_SMALL_TO_BIG_ENABLED:false}
+    parent-max-chars: ${RAG_SMALL_TO_BIG_PARENT_MAX_CHARS:4096}
+  # LLM 单价（USD / 1M tokens），用于评估报告的 Cost 估算（改写+压缩+生成+裁判 的 token 汇总）
+  llm-price-per-1m-tokens: 2.0
+  # ---------- RAG 性能预算（阶段超时 + 超限上报，不熔断） ----------
+  budget:
+    rewrite-ms: 3000
+    # 06 章 3.1 P1-5（2026-09-19）：retrieval-ms 是并行召回**单路**的硬超时阈值
+    # （Python 侧 RETRIEVAL_LEG_TIMEOUT_MS 对齐），超时那一路降级为「无结果」、用另一路继续融合；
+    # <=0 关闭超时（回到只上报的旧行为）。
+    # ⚠️ 它只让「用户等待」有上限，不中断底层任务：被挂住的 worker 线程仍占到 HTTP read-timeout 才释放。
+    retrieval-ms: 2000
+    rerank-ms: 3000
+    compression-ms: 2000
+    generation-ms: 30000
+    tokens: 4000
+    cost-usd: 0.01
+
+# ---------- Agent（Tool Calling Loop）配置 ----------
+# Agent决策/摘要快照总预算30s，Java完整响应体预算另留5s传输余量。
+# 单模型超时、重试和资源等待共同受总预算约束，选型来自用户用途/Agent配置。
+model-management:
+  # 与JWT/内部令牌分离；空值允许启动和管理无密钥模型，但禁止保存云端凭证。
+  encryption-key: ${MODEL_CONFIG_ENCRYPTION_KEY:}
+  defaults:
+    # 首次启动自动登记一组部署共享的本地模型；个人用途绑定仍可覆盖。
+    ollama-base-url: ${MODEL_DEFAULT_OLLAMA_BASE_URL:http://localhost:11434/v1}
+    rerank-base-url: ${MODEL_DEFAULT_RERANK_BASE_URL:http://localhost:8091/v1}
+    # llama.cpp 重排服务由部署端保护；密钥只从进程环境注入执行快照，不写数据库。
+    rerank-api-key: ${MODEL_DEFAULT_RERANK_API_KEY:}
+
+agent:
+  llm:
+    # 所有Agent模型调用固定经过Python治理入口，已移除direct选型。
+    gateway:
+      connect-timeout-ms: 3000
+      read-timeout-ms: 35000
+  max-iterations: 12
+  # 一次 Agent 会话允许的最大工具调用总数（LLM 想发更多 → MAX_TOOL_CALLS 即停，不执行）
+  max-tool-calls: 10
+  # 一次 decision 多个工具调用的并发执行上限（Semaphore 封顶）
+  max-concurrent-tools: 4
+  # ---------- ReAct 循环护栏 ----------
+  # 轮次/预算用尽且本轮已有工具结果时，追加收尾指令再调一次模型（不给工具）产出答案；
+  # false = 保持旧语义（answer 为空 + 历史占位），多一次调用的成本换「不交白卷」。
+  react:
+    finalize-on-exhaust: true
+    # 模型自然停止但正文为空时，追加 nudge 逼它出正文的次数（不消耗轮次）
+    max-empty-retries: 2
+    # 连续在输出上限处被截断的轮次上限：达到即判卡死（多半是参数越写越长）
+    max-consecutive-truncated-rounds: 3
+    # 单个工具结果喂回模型时的字符上限（按 code point 计，超出保留头 70% + 尾 30%）。
+    # 🔴 必须 ≤ 上下文可用提示词（= context.max-tokens − 两项 reserved）。
+    # 依据：knowledge_search 默认 topK=5、单块 800 字符（CHUNK_SIZE），一次标准检索约 4000 字符；
+    # 上限低于这个数就必然把命中的证据截掉一半，高于它则单条结果装不进上下文（只能整条丢弃，
+    # 等于本轮检索白做）。越界由 AgentBudgetGuard 在启动时拒绝，不留到运行期。
+    tool-output-max-chars: 4000
+    # 显式登记为执行屏障的工具（逗号分隔）；requiresApproval=true 的工具自动成为屏障
+    barrier-tools: ""
+  # ---------- SSE 流式 ----------
+  stream:
+    # 单条流的存活上限，必须大于 budget-time-ms（兜底合成可能在其后发生）
+    timeout-ms: ${AGENT_STREAM_TIMEOUT_MS:180000}
+    # 心跳注释帧间隔：模型思考期可能长时间无正文，防中间层判空闲断连
+    heartbeat-ms: 15000
+  # ---------- 工具审批门（HITL）----------
+  # requiresApproval 的工具（将来接外部 MCP 写操作）在执行前必须有一份「精确匹配本次参数」的审批，
+  # 否则 ToolExecutor fail-close 拒绝。审批状态放 Redis（跨实例）；TTL 内未执行即自动失效回到 fail-close。
+  tool:
+    approval:
+      ttl-minutes: ${AGENT_TOOL_APPROVAL_TTL_MINUTES:30}
+  # 是否并行执行一次 decision 的多个独立工具（false → 顺序执行）
+  parallel-tools: true
+  # Agent 总时间预算（含多次 LLM 决策 + 工具执行 + 回灌），必须 > tool.timeout-ms
+  budget-time-ms: 120000
+  # ---------- Memory 摘要 ----------
+  memory:
+    summary:
+      # 会话 token 估算超该值触发「折旧存新」压缩。
+      # 🔴 必须 < 下面 context 的可用提示词预算：否则装配期裁剪总是先于摘要触发，
+      # 会话退化为滑动窗口（摘要永远滞后一步）。越界由 AgentBudgetGuard 拒绝启动。
+      max-tokens: 3000
+      # 压缩后保留的最近消息条数（Sliding Window 窗口）
+      retain-recent: 6
+      # 异步摘要超时（超过记 agent.summary.timeout 指标，不中断任务/不阻塞响应）
+      timeout-ms: 30000
+      # 降级归档不单独配额度：摘要模型不可用时写「原始对话摘录」，其上限取 max-tokens 的 1/4
+      # （默认 750）——归档进的是同一个 system 段，单独可调只会再造一处组合出错的配置。
+    # ---------- 跨会话长期记忆（最小版）----------
+    # 只做「显式写入 + 词法召回」：模型须调 memory_save（通常因用户说「记住…」）才会写，
+    # 没有后台自动抽取、没有向量语义召回、没有待确认/整理队列。与用户画像相关的产品化能力另立项。
+    # 作用域是 userId（来自认证上下文），与会话记忆是两个键空间：agent:memory:long:{userId}。
+    # enabled=false 时两个工具 Bean 都不装配（schema 里也不会出现），不是「装上但执行时报错」。
+    long-term:
+      enabled: true
+      # 每个用户最多保留多少条，超出淘汰最旧的
+      max-items: 50
+      # 装配期最多注入几条（0 = 不注入）；整块另有 400 token 上限，见 DefaultContextBuilder
+      inject-limit: 5
+      # 单条内容的最大字符数，超出截断
+      max-content-chars: 500
+  # ---------- Context 装配预算 ----------
+  # 数值关系（AgentBudgetGuard 启动时校验，越界拒绝启动）：
+  #   可用提示词 = max-tokens − reserved-output-tokens − reserved-tool-tokens
+  #   工具结果上限 ≤ 可用提示词 < max-tokens
+  #   摘要阈值 < 可用提示词
+  # 所选模型记录的contextWindow和Ollama compat.numCtx也应足够容纳本上下文预算。
+  context:
+    # 上下文窗口（提示词 + 生成答案 + 工具调用共用）；超预算时先裁最旧窗口、
+    # 再整组裁最旧的工具往返、最后截断单条证据尾部，Required 不裁。
+    # Required（system/summary/currentQuery）或单条证据已截到下限仍超预算时，
+    # 击穿量由 agent.context.budget_exceeded[.tokens] 两个 counter 暴露。
+    max-tokens: 8192
+    # 给生成答案预留的 token 槽
+    reserved-output-tokens: 1200
+    # 给工具调用预留的 token 槽（assistant 一次可能发多个 call，参数也占提示词）
+    reserved-tool-tokens: 400
+
+# ---------- Agent 工具执行 ----------
+tool:
+  # 单个工具一次执行的总超时。
+  # 覆盖整条 RAG 管线：Query Rewrite + Embedding + 向量/关键词并行 + RRF + Rerank(recall-n 个候选)。
+  # 具体重排服务由用户rerank用途绑定；缺配置或故障明确失败。
+  timeout-ms: 60000
+  # 瞬时失败最大重试次数；校验/权限/业务失败与代码 bug 一律不重试（白名单见 ToolExecutor.isTransient）
+  max-retries: 1
+  # 第n次工具重试前等待 retry-backoff-ms × 2^(n-1)。模型自身默认不重试。
+  retry-backoff-ms: 500
+
+# ---------- AI HTTP 客户端（Java → Python 127.0.0.1:8000）超时 ----------
+ai:
+  client:
+    connect-timeout-ms: 3000
+    # 旧键保留给外部配置兼容；AiServiceClient 分别读取 ingest/query 预算。
+    # 问答总预算默认 270 秒，HTTP 读取给 Python 终态留出 5 秒余量。
+    # parse/embed 独立给 120 秒，避免调整问答等待上限后截断较长文档入库。
+    ingest-read-timeout-ms: 120000
+    query-read-timeout-ms: 275000
+    read-timeout-ms: 40000
+    base-url: ${AI_BASE_URL:http://127.0.0.1:8000}
+    # 内部鉴权令牌：Java→Python 每次调用带 X-Internal-Token（Python 侧 ai/app/security.py 校验）。
+    # **刻意不给默认值**——缺失即启动失败，与 JWT_SECRET 同款。给默认值等于给一个谁都知道的密钥，
+    # 那比不设鉴权更糟（看起来有防护，实际人人可进）。
+    # compose 里该值由 docker-compose.yml 从仓库根 .env 透传给 ai 与 backend **两侧，必须完全相同**。
+    # 生成：openssl rand -hex 32
+    internal-token: ${INTERNAL_API_TOKEN}
+    # ---------- 可用性熔断（快速失败，评审 B3）----------
+    # 只判「AI 服务还在不在」，与上面那条读超时分工不同（互补，不是替代）：
+    # 单个 Java → Python 熔断器，由 Resilience4j 管理计数窗口与状态。
+    # 连接故障/HTTP 5xx 为失败；读超时、4xx、主动取消排除，不触发重试或模型回退。
+    resilience:
+      enabled: ${AI_RESILIENCE_ENABLED:true}
+      sliding-window-size: ${AI_RESILIENCE_SLIDING_WINDOW_SIZE:10}
+      minimum-number-of-calls: ${AI_RESILIENCE_MINIMUM_CALLS:5}
+      failure-rate-threshold: ${AI_RESILIENCE_FAILURE_RATE:50}
+      open-cooldown-ms: ${AI_RESILIENCE_OPEN_COOLDOWN_MS:10000}
+      half-open-probes: ${AI_RESILIENCE_HALF_OPEN_PROBES:1}
+
+# ---------- 向量引擎 ----------
+# pgvector：PG 内 halfvec(2560) + HNSW，单库自洽，无跨库一致性窗口 —— **当前唯一的引擎**。
+# 🔴 2026-09-26：`milvus` 档与整个 `milvus.*` 配置块已删除（退役依据见本文件开头「数据库决策」段）。
+# 装配点唯一：VectorStoreConfig（service/vectorstore/）。
+vector:
+  store: ${VECTOR_STORE:pgvector}
+
+task:
+  broadcast:
+    enabled: ${TASK_STATUS_BROADCAST_ENABLED:false}
+    channel: ${TASK_STATUS_BROADCAST_CHANNEL:ekip:document-task:v1}
+  reliability:
+    max-attempts: 3
+    backoff-base-ms: 5000
+    backoff-cap-ms: 60000
+    # 单次执行硬上限。续租间隔 < 租期 < 硬上限，退避中的任务使用独立的重试时间。
+    stuck-timeout-ms: 600000
+    lease-duration-ms: 120000
+    lease-renew-interval-ms: 20000
+    orphan-scan-interval-ms: 30000
+    # WAITING 投递恢复使用独立年龄阈值；60s 是待运行环境校准的操作默认值，不是 SLA。
+    waiting-timeout-ms: 60000
+    recovery-batch-size: 100
+    # 启动恢复 + 孤儿扫描总开关（生产 true；@SpringBootTest 一律 false 避免上下文加载时动数据库）
+    recovery-enabled: true
+
+# ---------- 观测：业务 Trace 环形缓冲保留条数 ----------
+observability:
+  capabilities:
+    refresh-interval-ms: 10000
+    initial-delay-ms: 1000
+    probe-timeout-ms: 750
+  trace:
+    retention: 1000
+
+# ---------- MCP Server（对外暴露知识库能力；spec 见 docs/superpowers/specs/2026-09-09-mcp-server-design.md） ----------
+# 传输：Streamable HTTP（有会话）；鉴权：Bearer ekip_mcp_xxx 长期凭证（可吊销，走 per-user default-deny 权限）
+# enabled=false 时传输层与过滤器整段不装配，/mcp 返回 404
+mcp:
+  enabled: true
+  endpoint: /mcp
+  server-name: ekip-knowledge
+  server-version: 1.0.0
+  instructions: >-
+    企业知识库检索与问答。knowledge_search 只做检索、返回证据片段，速度快、不消耗 LLM；
+    knowledge_ask 会基于检索到的证据生成答案，耗时可达数十秒。
+    需要原文证据时用 knowledge_search，需要直接答案时用 knowledge_ask。
+  keep-alive-interval: 15s
+  # 必须 > tool.timeout-ms(60s)：否则 MCP 层先超时，工具结果还没回来
+  request-timeout: 90s
+  # default-deny：不在此列的 AgentTool 一律不对外；写了未注册的名字会让启动失败（防静默漏配）
+  exposed-tools:
+    - knowledge_search
+    - knowledge_ask
+  security:
+    # Host 白名单（含端口）防 DNS rebinding；集成测试用 127.0.0.1:* 放开随机端口
+    allowed-hosts:
+      - 127.0.0.1:8080
+      - localhost:8080
+    # 空列表 = 不额外放行任何浏览器 Origin（非浏览器 MCP 客户端不发 Origin，不受影响）
+    allowed-origins: []

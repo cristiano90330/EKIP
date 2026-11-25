@@ -1,0 +1,47 @@
+# AI 服务核心依赖（Python 3.10，pytorch_env）
+# 安装：pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# --- Web 服务 ---
+fastapi
+uvicorn
+python-multipart      # FastAPI 文件上传
+
+# --- 文档解析 ---
+pdfplumber             # PDF 表格/结构解析（ai/app/parser/pdf_parser.py）
+python-docx            # docx 解析（ai/app/parser/docx_parser.py）
+openpyxl               # xlsx 解析（ai/app/parser/excel_parser.py）
+xlrd                   # xls（BIFF）解析；openpyxl 不支持旧格式，xlrd 2.x 只支持 .xls
+python-pptx            # pptx 解析（ai/app/parser/pptx_parser.py）
+beautifulsoup4         # epub 内的 XHTML 正文提取（ai/app/parser/epub_parser.py）
+# 旧版二进制 .doc/.ppt 需要部署侧提供 LibreOffice（SOFFICE_BIN），不在 Python 依赖内。
+
+# --- 分词（jieba 中文关键词检索）---
+jieba                 # ai/app/keyword/segmenter.py 的分词实现
+
+# --- 对象存储 ---
+minio
+
+# --- LLM（OpenAI 兼容接口：DeepSeek/通义/智谱）---
+openai>=2.53.0,<3
+
+# --- 托管模型的 HTTP 客户端 ---
+# openai SDK 已传递依赖 httpx，这里显式声明——我们直接 import 它，不该依赖别人的传递依赖
+httpx
+
+# --- RAG 编排：固定流程 / LangChain 共存（生产 LCEL 使用核心标准接口）---
+langchain-core==1.5.3
+langsmith==0.10.10     # 直接使用 tracing_context，强制关闭远端内容追踪
+
+# --- 配置 ---
+python-dotenv          # 加载 ai/.env
+
+# --- 可观测性 ---
+prometheus-client      # 3.1 P0-6：/metrics 端点（始终注册；METRICS_ENABLED=false 时返回 404，2026-09-30 起默认 true）
+# 可选 OTLP 阶段导出依赖；默认 OTEL_ENABLED=false，不要求 Collector/Langfuse 常驻。
+# 完整观测 Compose 显式开启出口；响应 stages[]、结构化日志及指标始终独立保留。
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+
+# --- 验证脚本 ---
+psycopg2-binary        # eval/run_eval.py 及隔离 PostgreSQL 验证工具

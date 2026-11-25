@@ -1,0 +1,4 @@
+# 复用本机 Qwen3 指令模型，并为日常问答配置 8192 上下文。
+
+FROM ekip-qwen3:4b-instruct-4k
+PARAMETER num_ctx 8192

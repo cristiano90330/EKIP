@@ -1,0 +1,7 @@
+# 在本机开发验收时显式开启 RAG 连通性模式，用真实 Chat 模型检查问答传输。
+
+services:
+  ai:
+    environment:
+      EKIP_ENV: development
+      RAG_DEV_TEST_MODE: "true"

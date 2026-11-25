@@ -1,0 +1,234 @@
+# 装配 PostgreSQL、Redis、MinIO 和 Java、Python 服务，定义端口、依赖与探针。
+
+# 显式项目名让 Compose 在中文目录下也使用同一个部署身份。
+name: ekip
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ekip-postgres
+    # halfvec(2560) 的 HNSW 索引构建/查询所需（见 docs/superpowers/specs/
+    # 2026-09-16-single-pg-consolidation-design.md §4 调优表）：
+    # maintenance_work_mem 默认 64MB 不够建 2560 维 HNSW 索引，会退化成磁盘排序；
+    # shared_buffers 默认 128MB 装不下 1 万 chunk 的索引（约 150MB），查询要走磁盘；
+    # max_parallel_maintenance_workers 默认 2，提高至 4 可并行建索引。
+    command: >
+      postgres
+      -c maintenance_work_mem=256MB
+      -c shared_buffers=512MB
+      -c max_parallel_maintenance_workers=4
+    environment:
+      POSTGRES_PASSWORD: "123456"
+      POSTGRES_DB: knowledge
+    ports: ["5432:5432"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d knowledge"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7
+    container_name: ekip-redis
+    # 测试使用随机 loopback 端口的一次性 Redis，不连接此运行实例。
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  minio:
+    # 必须钉版本：原来裸 `minio/minio` 隐式 latest，不可复现（本文件里 minio-init 的 mc 命令、
+    # console 端口行为都依赖它）。此 tag 取自本机镜像自带的 release 标签，非猜测。
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: ekip-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: "12345678"
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  minio-init:
+    # 一次性任务：建 knowledge-files 桶（MinIO 不自建桶，backend/ai 的上传下载都依赖它存在）。
+    # mc 镜像不带自己的 release 标签（只有 UBI base 的），拿不到可读 tag，故钉 digest 保证可复现。
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    container_name: ekip-minio-init
+    restart: on-failure
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 admin 12345678 &&
+                  mc mb --ignore-existing local/knowledge-files"
+
+  ai:
+    build:
+      context: ./ai
+      dockerfile: Dockerfile
+    container_name: ekip-ai
+    restart: on-failure
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: "12345678"
+      MINIO_BUCKET: knowledge-files
+      # 切块参数；向量维度由知识库活动索引快照决定。
+      CHUNK_SIZE: ${CHUNK_SIZE:-800}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
+      # 只读 PG（决策文档 §4 第 5 项「重切边界」）：/rag/query 端到端管线直连检索。
+      # AI 仅使用专用只读身份；凭据必须由受控环境配置提供，不继承 backend 的 POSTGRES_*。
+      # V5收敛到document_chunk；V16仅增加两张固定维度向量表的SELECT。
+      PG_READONLY_HOST: ${PG_READONLY_HOST:-postgres}
+      PG_READONLY_PORT: ${PG_READONLY_PORT:-5432}
+      PG_READONLY_DB: ${PG_READONLY_DB:-knowledge}
+      PG_READONLY_USER: ${PG_READONLY_USER:?PG_READONLY_USER is required}
+      PG_READONLY_PASSWORD: ${PG_READONLY_PASSWORD:?PG_READONLY_PASSWORD is required}
+      # 模型由 Java 管理并按请求传执行快照；本服务不再从环境选型或固定回退。
+      MODEL_RESOURCE_GROUPS: ${MODEL_RESOURCE_GROUPS:-}
+      MODEL_RESOURCE_QUEUE_LIMIT: ${MODEL_RESOURCE_QUEUE_LIMIT:-8}
+      # 本机调试模式默认关闭；临时覆盖见 docker-compose.dev-test.yml。
+      EKIP_ENV: production
+      RAG_DEV_TEST_MODE: "false"
+      # 查询的并行召回等待上限与模型总预算共同生效。
+      RETRIEVAL_LEG_TIMEOUT_MS: ${RETRIEVAL_LEG_TIMEOUT_MS:-2000}
+      RAG_QUERY_DEADLINE_MS: ${RAG_QUERY_DEADLINE_MS:-270000}
+      RAG_QUERY_MAX_INFLIGHT: ${RAG_QUERY_MAX_INFLIGHT:-4}
+      RAG_QUERY_MAX_TOP_K: ${RAG_QUERY_MAX_TOP_K:-20}
+      RAG_QUERY_MAX_RECALL_N: ${RAG_QUERY_MAX_RECALL_N:-100}
+      RAG_QUERY_MAX_HISTORY_MESSAGES: ${RAG_QUERY_MAX_HISTORY_MESSAGES:-32}
+      RAG_QUERY_MAX_HISTORY_CHARS: ${RAG_QUERY_MAX_HISTORY_CHARS:-30000}
+      RAG_RETRIEVAL_MAX_INFLIGHT: ${RAG_RETRIEVAL_MAX_INFLIGHT:-4}
+      # 评分准入要求模型语义指纹匹配的显式校准。
+      RAG_EVIDENCE_POLICY_VERSION: ${RAG_EVIDENCE_POLICY_VERSION:-fail-closed-v1}
+      # 证据准入模式：score（默认，需校准阈值）/ support（绑定审查模型，要求完整召回）。
+      RAG_EVIDENCE_MODE: ${RAG_EVIDENCE_MODE:-score}
+      RAG_GENERATE_HISTORY_TOKENS: ${RAG_GENERATE_HISTORY_TOKENS:-300}
+      # 阶段级埋点的 OTel 出口（决策文档 §3.3 / §5.13.7 第 4 条）。
+      # 默认方案只保留阶段响应、日志和指标；外部导出由可选 Compose 显式启用。
+      OTEL_ENABLED: "false"
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-ekip-ai}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://127.0.0.1:4318/v1/traces}
+      # 阶段汇总日志与 Prometheus 文本端点（后者受 X-Internal-Token 保护，开不等于对外暴露）。
+      RAG_STAGE_LOG_ENABLED: ${RAG_STAGE_LOG_ENABLED:-true}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      # 内部鉴权令牌（2026-09-29）：**必须与 backend 侧同一个值** —— Java 每次调用都带
+      # X-Internal-Token，Python 侧 ai/app/security.py 校验，不符即 401。
+      # 缺失即 compose 层硬失败（AI 服务在 main.py lifespan 里同样 fail-fast，双层拦截）。
+      # 为什么不能给默认值：无鉴权启动 = 把「按调用方自带的 kbIds 读任意知识库」的 /rag/query
+      # 发布在 0.0.0.0:8000 上（本服务映射了宿主端口 8000）。
+      # 报错文案用 ASCII 且不含「冒号+空格」——同 JWT_SECRET 那条的理由（GBK 控制台 / YAML 解析）。
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required -- generate one with openssl rand -hex 32 and put it in the repo-root .env}
+    # 历史上宿主 8000 落在 Windows 排除端口段(7926-8025)内，曾改映射 18000；2026-09-22 系统动态端口
+    # 范围挪到高位后回到 8000，与 application.yml 的 ai.client.base-url 默认值对齐（少一处端口分叉）。
+    # 代价：compose 起着 ai 时，本机 `uvicorn ... --port 8000` 会撞端口，要先 `docker compose stop ai`。
+    ports: ["8000:8000"]
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      # 启动仅校验基础配置并初始化服务，不预热模型；给基础设施初始化留余量。
+      start_period: 120s
+
+  backend:
+    # 多实例共享 PostgreSQL 任务租约；跨实例 SSE 通知需要启用任务广播。
+    # 水平扩容前必须改造（实例标识/心跳租约 + 事件广播）；同类约束记录在
+    # TaskRecoveryService 类注释与 application.yml 的 task.reliability 段。
+    build:
+      context: ./knowledge-platform
+      dockerfile: Dockerfile
+    container_name: ekip-backend
+    environment:
+      # 缺失即 compose 层硬失败（后端 JwtUtil 构造期也会 fail-fast，双层拦截）。
+      # 生成：openssl rand -base64 48 ；写入仓库根 .env（已被 .gitignore 忽略，见 .env.example）
+      # 报错文案用 ASCII：Windows 控制台下 compose 输出的中文会被 GBK 解码成乱码，等于没提示。
+      # 且文案里禁止出现「冒号+空格」——YAML 会把它当嵌套映射解析（go-yaml: mapping values are not allowed）
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required -- generate one with openssl rand -base64 48 and put it in the repo-root .env}
+      MODEL_CONFIG_ENCRYPTION_KEY: ${MODEL_CONFIG_ENCRYPTION_KEY:-}
+      MODEL_DEFAULT_OLLAMA_BASE_URL: ${MODEL_DEFAULT_OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      MODEL_DEFAULT_RERANK_BASE_URL: ${MODEL_DEFAULT_RERANK_BASE_URL:-http://host.docker.internal:8091/v1}
+      MODEL_DEFAULT_RERANK_API_KEY: ${MODEL_DEFAULT_RERANK_API_KEY:-}
+      JWT_ACCESS_EXPIRE_MINUTES: ${JWT_ACCESS_EXPIRE_MINUTES:-15}
+      JWT_REFRESH_EXPIRE_DAYS: ${JWT_REFRESH_EXPIRE_DAYS:-7}
+      EKIP_ACCOUNT_ADMIN_USERNAME: ${EKIP_ACCOUNT_ADMIN_USERNAME:-}
+      LOGIN_THROTTLE_ENABLED: ${LOGIN_THROTTLE_ENABLED:-true}
+      LOGIN_THROTTLE_MAX_ATTEMPTS: ${LOGIN_THROTTLE_MAX_ATTEMPTS:-5}
+      LOGIN_THROTTLE_LOCK_MINUTES: ${LOGIN_THROTTLE_LOCK_MINUTES:-15}
+      # 唯一关系库：业务表 + document_chunk 都在这个 PG 里（env 名与 application.yml 的 POSTGRES_* 对齐）
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: knowledge
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "123456"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TASK_STATUS_BROADCAST_ENABLED: ${TASK_STATUS_BROADCAST_ENABLED:-false}
+      TASK_STATUS_BROADCAST_CHANNEL: ${TASK_STATUS_BROADCAST_CHANNEL:-ekip:document-task:v1}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: "12345678"
+      MINIO_BUCKET: knowledge-files
+      AI_BASE_URL: http://ai:8000
+      # 内部鉴权令牌（2026-09-29）：**必须与 ai 侧同一个值**。Java 侧由 AiServiceClient 的
+      # RestClient 拦截器统一带在 X-Internal-Token 上（一处注册覆盖全部调用），
+      # 对应 application.yml 的 ai.client.internal-token（那里无默认值，缺失则后端启动失败）。
+      # 缺失即 compose 层硬失败。报错文案同 JWT_SECRET：ASCII、不含「冒号+空格」。
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required -- generate one with openssl rand -hex 32 and put it in the repo-root .env}
+      # 向量引擎：2026-09-26 起只有 pgvector（Milvus 副本退役，见本文件末尾说明与
+      # application.yml 的「数据库决策」段）。设成别的值 → 后端**装配失败**（无 VectorStore bean）。
+      VECTOR_STORE: ${VECTOR_STORE:-pgvector}
+      # 编排实现与 retrieval.version 独立；公开 ask/chat/search 可逐请求覆盖。
+      RAG_PIPELINE_ENGINE: ${RAG_PIPELINE_ENGINE:-fixed}
+      RAG_QUERY_DEADLINE_MS: ${RAG_QUERY_DEADLINE_MS:-270000}
+      # 全本地轻量验证可选 hybrid，跳过独立重排模型。
+      RETRIEVAL_VERSION: ${RETRIEVAL_VERSION:-hybrid-rerank-rewrite}
+      # 保留产品 Trace 与 Micrometer；完整观测方案才开启外部 OTLP 导出。
+      OTEL_ENABLED: "false"
+      OTEL_TRACES_ENDPOINT: ${OTEL_TRACES_ENDPOINT:-http://127.0.0.1:4318/v1/traces}
+    ports: ["8080:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+
+  # 🔴 2026-09-26 减法：Milvus standalone 三件套（milvus-etcd / milvus-minio / milvus-standalone）
+  # 与 profile "milvus" **已删除**。退役依据（全是实测）：
+  #   ① 一致性探针：两引擎命中集合相同 16/16、顺序完全相同 16/16，逐条 distance 最大差 1.7e-05
+  #      （eval/reports/engine_parity_probe_20260916_193627.txt）；
+  #   ② 评测：milvus 与 pgvector 指标**完全相同**（recall/mrr/ndcg 逐项相同）；
+  #   ③ 装配期连接失败是**致命**的：实测以 milvus 配置启动 10 次失败 4 次（Connect RPC
+  #      DEADLINE_EXCEEDED），整个应用上下文起不来，不是"连不上就降级走 PG"。
+  # → 零收益 + 一个能拖垮启动的失败模式，删。
+  # 向量真源一直是 PG（halfvec(2560) + HNSW）；Milvus 的迁移/对比能力改为**离线工具**保留：
+  #   历史迁移和一致性探针见 docs/archive/2026-11-19-retired-tools/README.md。
+  # 历史沿革（别据此判断现在）：改造前 PG 列是 vector(2560)，**vector** 的 HNSW 上限 2000 维，
+  # 当时 PG 侧建不了索引才一度把主线迁到 Milvus；单 PG 收口后列改 halfvec(2560)（上限 4000 维），
+  # HNSW 在 PG 内直接建得起来。原配套手册 docs/milvus-migration-guide.md 已于 2026-09-21 删除。
+
+volumes:
+  pg_data:
+  minio_data:

@@ -1,0 +1,43 @@
+[
+  {
+    "name": "具名事件和心跳注释",
+    "wire": ": heartbeat\nevent: delta\ndata: {\"text\":\"你好🌍\"}\n\nevent: done\ndata: {\"outcome\":\"success\"}\n\n",
+    "frames": [
+      { "event": "delta", "data": "{\"text\":\"你好🌍\"}" },
+      { "event": "done", "data": "{\"outcome\":\"success\"}" }
+    ]
+  },
+  {
+    "name": "默认事件与忽略未知字段",
+    "wire": "id: 17\nretry: 500\nignored: value\ndata: {\"status\":\"PROCESSING\"}\n\n",
+    "frames": [{ "event": "message", "data": "{\"status\":\"PROCESSING\"}" }]
+  },
+  {
+    "name": "多行数据与B0行空白兼容",
+    "wire": "event:  custom  \ndata:  first  \ndata:  second  \n\n",
+    "frames": [{ "event": "custom", "data": "first\nsecond" }]
+  },
+  {
+    "name": "CRLF帧与UTF8",
+    "wire": "event: delta\r\ndata: {\"text\":\"中文引用🙂\"}\r\n\r\nevent: error\r\ndata: {\"reasonCode\":\"dependency_unavailable\"}\r\n\r\n",
+    "frames": [
+      { "event": "delta", "data": "{\"text\":\"中文引用🙂\"}" },
+      { "event": "error", "data": "{\"reasonCode\":\"dependency_unavailable\"}" }
+    ]
+  },
+  {
+    "name": "EOF无最后空行仍消费末帧",
+    "wire": "event: done\ndata: {\"finished\":true}",
+    "frames": [{ "event": "done", "data": "{\"finished\":true}" }]
+  },
+  {
+    "name": "EOF已有换行但无分帧空行",
+    "wire": "data: tail\n",
+    "frames": [{ "event": "message", "data": "tail" }]
+  },
+  {
+    "name": "忽略无数据帧但保留空data字段",
+    "wire": "event: ignored\n\n: heartbeat\n\ndata:\n\n",
+    "frames": [{ "event": "message", "data": "" }]
+  }
+]

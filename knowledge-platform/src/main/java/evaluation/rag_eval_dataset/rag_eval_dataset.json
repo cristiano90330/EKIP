@@ -1,0 +1,18 @@
+[
+  {
+    "question": "Spring Boot如何实现依赖注入？",
+    "relevant_chunk_ids": [10, 11]
+  },
+  {
+    "question": "MyBatis Plus有什么作用？",
+    "relevant_chunk_ids": [25, 26]
+  },
+  {
+    "question": "Redis是什么？",
+    "relevant_chunk_ids": [40]
+  },
+  {
+    "question": "如何配置数据库连接？",
+    "relevant_chunk_ids": [51, 52]
+  }
+]

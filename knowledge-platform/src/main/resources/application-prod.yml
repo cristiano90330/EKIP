@@ -1,0 +1,16 @@
+# 在 prod profile 收紧 Actuator，保留健康、服务信息和 Prometheus 指标入口。
+
+management:
+  endpoint:
+    # 运行时改日志级别的入口，即便已认证也不在开放环境暴露
+    loggers:
+      enabled: false
+    # env 会列出全部配置项与环境变量名（值被脱敏，但键名本身即情报）
+    env:
+      enabled: false
+    configprops:
+      enabled: false
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """验证对象解析接口的文件生命周期、格式入口及错误状态。"""
 
+import asyncio
 import json
 import os
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -15,10 +17,66 @@ from ai.app.parser import router as parser_module
 from ai.app.parser import pipeline as pipeline_module
 from ai.app.parser.errors import DocumentInputError
 from ai.app.parser.blocks import Block, BlockType
+from ai.app.models.cancellation import wait_or_cancel
+from ai.app.rag.deadline import QueryDeadlineExceeded
 from ai.app.main import app
 from ai.tests.conftest import AUTH_HEADERS
 
 client = TestClient(app, headers=AUTH_HEADERS)
+
+
+def test_parser_disconnect_stops_running_work_and_removes_temp_file(monkeypatch):
+    """让真实 ASGI 路由收到断连，中断在途解析并清理下载文件。"""
+    started = Event()
+    stopped = Event()
+    paths = []
+
+    def download(_, __, path):
+        paths.append(path)
+
+    def parse(*args, **kwargs):
+        started.set()
+        try:
+            wait_or_cancel(3)
+            pytest.fail("解析运行到等待上限，未看到请求断开")
+        except QueryDeadlineExceeded:
+            stopped.set()
+            raise
+
+    async def exercise():
+        messages = []
+        payload = json.dumps({
+            "documentId": 7, "objectName": "fixture.pdf", "bucketName": "fixtures",
+            "fileExtension": "pdf",
+        }).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": payload, "more_body": False}
+            assert await asyncio.to_thread(started.wait, 2)
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "method": "POST",
+            "path": "/parser/object", "root_path": "", "query_string": b"",
+            "scheme": "http", "server": ("localhost", 80), "client": ("localhost", 1234),
+            "headers": [(b"content-type", b"application/json"),
+                        (b"x-internal-token", AUTH_HEADERS["X-Internal-Token"].encode())],
+        }
+        await asyncio.wait_for(app(scope, receive, send), 5)
+        assert any(msg.get("status") == 499 for msg in messages)
+
+    monkeypatch.setattr(parser_module, "minio_service", SimpleNamespace(download_file=download))
+    monkeypatch.setattr(parser_module, "parse_local_document", parse)
+    asyncio.run(exercise())
+    assert stopped.is_set()
+    assert paths and all(not os.path.exists(path) for path in paths)
 
 
 # ---------- schema ----------

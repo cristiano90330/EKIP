@@ -76,7 +76,7 @@ VITE_USE_MOCK=true npm run dev     # 前端独立开发，不依赖任何后端
 | `/login` | `LoginView.vue` | 登录与注册切换；注册成功返回登录，登录成功写入令牌并跳转 |
 | `/overview` | `OverviewView.vue` | Bento 总览：快速提问、待处理、能力就绪、最近文档、请求分布、延迟与成本（15 秒轮询） |
 | `/library` | `LibraryView.vue` | 知识库新建与编辑、共享状态和成员管理、整库删除、文档上传回执、任务重试与切片浏览 |
-| `/ask` | `AskView.vue` | 全部可读库单轮问答、指定库多轮追问、服务端历史与删除、流程选择（`fixed` / `langchain`）、引用和失败诊断 |
+| `/ask` | `AskView.vue` | 全部可读库和指定库的多轮问答、服务端历史与删除、流程选择（`fixed` / `langchain`）、引用和失败诊断 |
 | `/agent` | `AgentView.vue` | Agent 配置、工具目录、证据引用、服务端会话恢复与执行步骤 |
 | `/traces` | `TracesView.vue` | RAG 请求列表（`limit=50`，5 秒轮询）+ 阶段瀑布图 |
 | `/metrics` | `MetricsView.vue` | Actuator 指标卡片，5 秒轮询 |
@@ -178,14 +178,14 @@ src/
 
 ### 5. 问答链路
 
-问答页通过 `/rag/sessions` 管理会话。固定流程使用 `/knowledge/sessions/{id}/ask/stream`，LangChain 使用 `/rag/sessions/{id}/ask`。
+问答页通过 `/rag/sessions` 管理会话。固定流程和 LangChain 都使用 `/knowledge/sessions/{id}/ask/stream`，请求体传入所选引擎。
 
 - 前端问答请求预算为 **300 秒**，覆盖检索、重排和生成以及流式结束。
-- `AskView.vue` 通过 `askKnowledgeStream()` 读取增量正文；选择 `langchain` 或 mock 时，API 层改用完整 JSON。无增量正文时保留打字机展示。
+- `AskView.vue` 通过 `askKnowledgeStream()` 读取增量正文。模拟模式继续使用完整结果，无增量正文时可使用打字机展示。
 - 流式使用带 Bearer 的 `fetch`；收到 `done` 才确认完成，`error` 或缺少终止帧均按失败处理。HTTP 200 与部分正文不能作为成功依据。
-- 生成结果经 JSON Schema 完整校验后才发送正文 delta，阶段进度仍实时到达。`done` 为 Python 结果，前端把 `evidenceSources` 映射为页面 `sources`，只在 `success` 时展示；原始候选 `sources` 不作为页面来源。`no_evidence` 显示无资料提示，生成格式错误按依赖失败处理。
+- 固定流程在模型结果校验后发送正文。LangChain 的增量正文标为生成中，失败、超时或取消时清除。前端用 `done` 的最终正文和 `evidenceSources` 确认答案与引用。`no_evidence` 显示无资料提示，生成格式错误按依赖失败处理。
 - 失败统一抛 `RagRequestError`，把 `reasonCode` / HTTP 状态映射为用户可读文案（`query_deadline_exceeded` → 超时、`threshold_not_configured` → 门槛未配置、`scorer_unavailable`、`retrieval_unavailable`、403/400/422 等），并保留 `outcome` / `failedStage` / `requestId` 供排障。
-- **普通问答**默认使用全部可读知识库进行单轮检索。首次发送前选定一个库后，可以在同一会话继续追问，后端读取最近三个完成回合。换库需要新建会话。
+- **普通问答**默认选择全部可读知识库，也可在首次发送前选定单库。范围固定后，同一会话使用最近三个完成回合继续追问。全库可读范围变化或需要换库时，须新建会话。
 - **本次问答策略**默认沿用部署配置。轻量问答使用混合检索与正文审查，跳过重排。也可选重排加正文审查，或重排加分数阈值。后者需要已校准的有效阈值。答案区显示实际回传的检索与证据模式。
 - **普通问答历史**可从左侧目录恢复、向前翻页或删除。服务器保存成功回答和正常拒答。当前知识库权限不匹配时会话不可读取，仍可删除。模拟会话仅保存在页面内。
 
@@ -307,9 +307,9 @@ npm run build     # 产出 frontend/dist
 
 | 项 | 现状 |
 | --- | --- |
-| 问答流式输出 | 已接通 `fixed` SSE；`langchain` / mock 使用完整 JSON，尚需真实依赖环境验收 |
+| 问答流式输出 | `fixed` 和 `langchain` 均使用 SSE，模拟模式使用完整结果。不同模型供应商的增量表现需按实际部署核对。 |
 | 模型管理验收 | 通过 Java 模型管理接口持久化；真实模型连通性、质量、冷加载与显存容量需独立验收，mock 不执行真实推理或重建 |
-| RAG 多会话管理 | 真实模式恢复服务端会话和历史。全部可读库按单轮执行，选定单库可追问。模拟模式的会话在刷新后清空。 |
+| RAG 多会话管理 | 真实模式恢复服务端会话和历史。全库和单库均可追问，服务端在读取历史时核对固定范围。模拟模式的会话在刷新后清空。 |
 | 前端测试 | `npm run test:sse / test:models / test:uploads` 提供定向契约测试；未配置通用单元测试或浏览器 E2E 框架，另运行 typecheck/build |
 | 代码分割 | 路由和设置中的独立功能面板按需加载。库页的表格、抽屉、上传控件及 Agent 的选择框由对应页面引入。 |
 | 主题 | 亮 / 暗双主题，顶栏可切「跟随系统 / 亮色 / 暗色」，偏好存 `localStorage['ekip-theme']`；登录页没有顶栏，不能在登录页切换（已存的偏好照常生效） |

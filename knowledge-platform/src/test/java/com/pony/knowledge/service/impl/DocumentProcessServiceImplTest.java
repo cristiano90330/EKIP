@@ -11,6 +11,7 @@ import com.pony.knowledge.mapper.DocumentMapper;
 import com.pony.knowledge.mapper.DocumentTaskMapper;
 import com.pony.knowledge.service.DocumentChunkService;
 import com.pony.knowledge.service.ai.AiServiceClient;
+import com.pony.knowledge.service.ai.DocumentParseCancellation;
 import com.pony.knowledge.service.task.TaskFailureClassifier;
 import com.pony.knowledge.service.task.TaskDispatchCoordinator;
 import com.pony.knowledge.service.task.TaskLeaseHeartbeat;
@@ -18,6 +19,7 @@ import com.pony.knowledge.service.task.TaskStatusEventBus;
 import com.pony.knowledge.service.task.TaskCompletionService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientResponseException;
 
@@ -35,6 +37,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class DocumentProcessServiceImplTest {
@@ -107,21 +110,46 @@ class DocumentProcessServiceImplTest {
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(attempt);
         var registration = mock(TaskLeaseHeartbeat.Registration.class);
-        when(heartbeat.maintain(attempt)).thenReturn(registration);
+        when(heartbeat.maintain(eq(attempt), any())).thenReturn(registration);
         when(chunkService.completeTask(eq(attempt), eq(50L), any())).thenReturn(true);
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenReturn(new AiServiceClient.ParseResult());
 
         service.process(1L);
 
         var order = inOrder(heartbeat, ai, chunkService, registration);
-        order.verify(heartbeat).maintain(attempt);
-        order.verify(ai).parseDocument(anyLong(), anyString(), anyString(), anyString());
+        order.verify(heartbeat).maintain(eq(attempt), any());
+        order.verify(ai).parseDocument(anyLong(), anyString(), anyString(), anyString(), any());
         order.verify(chunkService).completeTask(eq(attempt), eq(50L), any());
         order.verify(registration).close();
         verify(completionService, never()).markFailed(any(DocumentTask.class), anyString(), anyString());
         verify(dispatchCoordinator, never()).scheduleRetry(any(), anyLong());
         verify(eventBus, never()).publish(any(DocumentTask.class));
+    }
+
+    /** 续租失效触发当前解析信号，传输结束后跳过切片、重试和失败状态。 */
+    @Test
+    void lostLeaseCancelsParserWithoutRetryingTheOldAttempt() {
+        DocumentTask attempt = task(1);
+        when(taskMapper.selectById(1L)).thenReturn(task(0), attempt);
+        when(documentMapper.selectById(10L)).thenReturn(doc());
+        when(completionService.claim(1L, 10L)).thenReturn(attempt);
+        var onLost = ArgumentCaptor.forClass(Runnable.class);
+        var registration = mock(TaskLeaseHeartbeat.Registration.class);
+        when(heartbeat.maintain(eq(attempt), onLost.capture())).thenReturn(registration);
+        when(ai.parseDocument(eq(10L), eq("a.pdf"), eq("knowledge-files"), eq("pdf"), any()))
+                .thenAnswer(call -> {
+                    onLost.getValue().run();
+                    DocumentParseCancellation cancellation = call.getArgument(4);
+                    org.junit.jupiter.api.Assertions.assertTrue(cancellation.isCancelled());
+                    throw new ResourceAccessException("parser disconnected");
+                });
+
+        service.process(1L);
+
+        verifyNoInteractions(chunkService, dispatchCoordinator, eventBus);
+        verify(completionService, never()).markFailed(any(), anyString(), anyString());
+        verify(registration).close();
     }
 
     /** 通过 {@code taskMapper.selectById}、{@code documentMapper.selectById} 驱动该场景，跳过受保护的调用。 */
@@ -132,7 +160,7 @@ class DocumentProcessServiceImplTest {
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(attempt);
         when(taskMapper.recordRetryFailure(1L, 1, 5_000L, "connect timeout", "AI_UNAVAILABLE")).thenReturn(1);
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new ResourceAccessException("connect timeout"));
 
         service.process(1L);
@@ -157,7 +185,7 @@ class DocumentProcessServiceImplTest {
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(retryFailure);
         when(taskMapper.recordRetryFailure(1L, 1, 5_000L, "connect timeout", "AI_UNAVAILABLE")).thenReturn(1);
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new ResourceAccessException("connect timeout"));
         doThrow(new IllegalStateException("timer queue full"))
                 .when(dispatchCoordinator).scheduleRetry(retryFailure, properties.backoffMs(1));
@@ -177,7 +205,7 @@ class DocumentProcessServiceImplTest {
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(attempt);
         when(completionService.markFailed(eq(attempt), anyString(), anyString())).thenReturn(true);
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new ResourceAccessException("connect timeout"));
 
         service.process(1L);
@@ -194,7 +222,7 @@ class DocumentProcessServiceImplTest {
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(attempt);
         when(completionService.markFailed(eq(attempt), anyString(), anyString())).thenReturn(true);
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new RestClientResponseException(
                         "unsupported", 422, "Unprocessable Entity", null,
                         new byte[0], StandardCharsets.UTF_8));
@@ -214,7 +242,7 @@ class DocumentProcessServiceImplTest {
 
         service.process(1L);
 
-        verify(ai, never()).parseDocument(anyLong(), anyString(), anyString(), anyString());
+        verify(ai, never()).parseDocument(anyLong(), anyString(), anyString(), anyString(), any());
         verify(eventBus, never()).publish(any(DocumentTask.class));
     }
 
@@ -239,7 +267,7 @@ class DocumentProcessServiceImplTest {
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(task(1), task(2), task(3));
         when(taskMapper.recordRetryFailure(eq(1L), anyInt(), anyLong(), eq("connect timeout"), eq("AI_UNAVAILABLE"))).thenReturn(1);
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new ResourceAccessException("connect timeout"));
 
         service.process(1L);
@@ -252,7 +280,7 @@ class DocumentProcessServiceImplTest {
         order.verify(completionService).markFailed(task(3), "connect timeout", "AI_UNAVAILABLE");
         verify(dispatchCoordinator, times(2)).scheduleRetry(any(), anyLong());
         verify(completionService, times(3)).claim(1L, 10L);
-        verify(ai, times(3)).parseDocument(anyLong(), anyString(), anyString(), anyString());
+        verify(ai, times(3)).parseDocument(anyLong(), anyString(), anyString(), anyString(), any());
     }
 
     /** 通过 {@code taskMapper.selectById}、{@code documentMapper.selectById} 驱动该场景，跳过受保护的调用。 */
@@ -261,7 +289,7 @@ class DocumentProcessServiceImplTest {
         when(taskMapper.selectById(1L)).thenReturn(task(0), null);
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(task(1));
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new ResourceAccessException("connect timeout"));
 
         service.process(1L);
@@ -278,7 +306,7 @@ class DocumentProcessServiceImplTest {
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(task(1));
         when(taskMapper.recordRetryFailure(1L, 1, 5_000L, "connect timeout", "AI_UNAVAILABLE")).thenReturn(1);
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new ResourceAccessException("connect timeout"));
         IllegalStateException rejected = new IllegalStateException("timer unavailable");
         doThrow(rejected).when(dispatchCoordinator).scheduleRetry(task(1), 5_000L);
@@ -298,7 +326,7 @@ class DocumentProcessServiceImplTest {
         when(taskMapper.selectById(1L)).thenReturn(task(0), cancelled);
         when(documentMapper.selectById(10L)).thenReturn(doc());
         when(completionService.claim(1L, 10L)).thenReturn(task(1));
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenReturn(new AiServiceClient.ParseResult());
 
         service.process(1L);

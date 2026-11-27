@@ -61,7 +61,7 @@ class SsePreflightErrorContractTest {
     /** 核对 HTTP 400。 */
     @Test void unsupportedStreamEngineRemains400Json() throws Exception {
         mvc(Runnable::run).perform(post("/knowledge/ask/stream").accept(MediaType.TEXT_EVENT_STREAM)
-                        .contentType(MediaType.APPLICATION_JSON).content("{\"question\":\"test\",\"pipelineEngine\":\"langchain\"}"))
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"question\":\"test\",\"pipelineEngine\":\"auto\"}"))
                 .andExpect(status().isBadRequest()).andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
                 .andExpect(jsonPath("$.code").value(400)).andExpect(request().asyncNotStarted());
         verifyNoInteractions(pipeline);

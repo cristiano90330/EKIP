@@ -180,7 +180,7 @@ public class RagStreamClient {
      * @return 验证执行策略后才向原订阅者转发的帧处理器
      */
     private FrameHandler guardedStrategy(AiServiceClient.RagQueryRequest request, FrameHandler consumer, String requestId) {
-        if (request.getEvidenceMode() == null) return consumer;
+        if (request.getEvidenceMode() == null && !"langchain".equals(request.getPipelineEngine())) return consumer;
         return new FrameHandler() {
             private boolean confirmed;
 
@@ -208,7 +208,7 @@ public class RagStreamClient {
     }
 
     /**
-     * 比对准备发出的请求参数和 Python 确认的执行策略。
+     * 核对 Python 实际使用的引擎、检索版本和请求显式指定的证据策略。
      * 下游为 RagQueryRequest.getPipelineEngine、RagQueryRequest.getVersion。
      *
      * @param request 当前调用的请求参数
@@ -220,7 +220,8 @@ public class RagStreamClient {
             var execution = objectMapper.readTree(data);
             if (execution != null && request.getPipelineEngine().equals(execution.path("pipelineEngine").asText())
                     && request.getVersion().equals(execution.path("retrievalVersion").asText())
-                    && request.getEvidenceMode().equals(execution.path("evidenceMode").asText())) {
+                    && (request.getEvidenceMode() == null
+                        || request.getEvidenceMode().equals(execution.path("evidenceMode").asText()))) {
                 return;
             }
         } catch (com.fasterxml.jackson.core.JsonProcessingException ignored) {

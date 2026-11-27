@@ -4,6 +4,7 @@ from typing import Iterator, List, Optional, Tuple
 
 from ai.app.parser.blocks import Block, BlockType
 from ai.app.keyword.segmenter import segment
+from ai.app.models.cancellation import check_cancelled
 
 
 def _serialize_table(rows: List[List[str]]) -> str:
@@ -60,6 +61,7 @@ def chunk_blocks(blocks: List[Block], chunk_size: int = 800, chunk_overlap: int 
         """
         if not content:
             return
+        check_cancelled()
         out.append({
             "chunkIndex": len(out),
             "content": content,
@@ -81,6 +83,7 @@ def chunk_blocks(blocks: List[Block], chunk_size: int = 800, chunk_overlap: int 
         pending = pending[-chunk_overlap:] if keep_tail and chunk_overlap else ""
 
     for b in blocks:
+        check_cancelled()
         if b.type == BlockType.HEADING:
             # 标题切换：先冲刷当前节文本（不保留尾部，干净地切到下一节）
             flush(keep_tail=False)

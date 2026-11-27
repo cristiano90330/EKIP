@@ -18,6 +18,7 @@ from xlrd.compdoc import CompDocError
 
 from ai.app.chunker.structured_chunker import chunk_blocks
 from ai.app.llm.telemetry import get_request_id
+from ai.app.models.cancellation import check_cancelled
 from ai.app.parser import (
     docx_parser, epub_parser, excel_parser, md_parser, pdf_parser, pptx_parser,
     text_parser, xmind_parser,
@@ -46,6 +47,7 @@ def _parse_by_ext(extension: str, path: str):
 
     上游为 `parse_local_document`，下游调用 `ai.app.parser.pdf_parser.extract_blocks`、`ai.app.parser.md_parser.extract_blocks`。
     """
+    check_cancelled()
     if extension == "pdf":
         return pdf_parser.extract_blocks(path)
     if extension in ("md", "markdown"):
@@ -165,6 +167,7 @@ def parse_local_document(
     started = perf_counter()
     removed = None
     try:
+        check_cancelled()
         removed = strip_nul_from_blocks(blocks, source=source)
     finally:
         logger.info(
@@ -176,7 +179,9 @@ def parse_local_document(
     started = perf_counter()
     chunks = None
     try:
+        check_cancelled()
         chunks = chunk_blocks(blocks, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        check_cancelled()
         if not chunks:
             raise DocumentInputError("文档解析失败: 未提取到文本")
     finally:

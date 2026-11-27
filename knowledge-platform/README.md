@@ -280,13 +280,16 @@ Compose 中 Java 使用服务名访问依赖；模型服务地址在用户模型
 | `task.reliability.orphan-scan-interval-ms` | `30000` | 运行期恢复扫描间隔 |
 | `task.reliability.recovery-batch-size` | `100` | 每批扫描量 |
 | `task.reliability.recovery-enabled` | `true` | 启动恢复与周期扫描 |
-| `storage.reclaim.enabled` | `false` | 孤儿对象回收，`STORAGE_RECLAIM_ENABLED` |
+| `storage.reclaim.mode` | `disabled` | 回收模式 `disabled / dry-run / delete`，通过 `STORAGE_RECLAIM_MODE` 设置 |
+| `storage.reclaim.enabled` | `false` | 兼容 `STORAGE_RECLAIM_ENABLED`。未指定新模式时，`true` 对应 `delete`，`false` 对应 `disabled` |
 | `storage.reclaim.grace-period-hours` | `24` | 回收宽限期，`STORAGE_RECLAIM_GRACE_HOURS` |
 | `storage.reclaim.scan-interval-ms` | `86400000` | 回收间隔，`STORAGE_RECLAIM_SCAN_MS` |
 | `storage.reclaim.initial-delay-ms` | `300000` | 回收首轮延迟，`STORAGE_RECLAIM_INITIAL_DELAY_MS` |
 | `observability.capabilities.refresh-interval-ms` | `10000` | 能力快照刷新间隔 |
 | `observability.capabilities.initial-delay-ms` / `observability.capabilities.probe-timeout-ms` | `1000` / `750` | 首次刷新延迟 / 探测等待上限 |
 | `observability.trace.retention` | `1000` | 实例内存 Trace 保留条数 |
+
+`dry-run` 与 `delete` 共用宽限期和候选筛选。预览记录候选对象和总数。数据库引用为空、引用查询失败或对象列表读取失败时跳过回收。无效的模式值会在启动时报错。根 Compose 通过 `STORAGE_RECLAIM_MODE` 传入新模式。
 
 ## 4. 认证与访问权限
 
@@ -364,7 +367,7 @@ Java 在 Security 之前建立请求标识，所有响应通过 `X-Request-ID` �
 | `POST /rag/chat` | `RagChatResponseDTO` 裸对象 |
 | `POST /agent/chat` | `AgentResponse` 裸对象 |
 | `POST /agent/chat/stream` | `text/event-stream`，`accepted / round / delta / tool_call / tool_result / answer / done / error` |
-| `POST /knowledge/ask/stream` | `text/event-stream`，`stage / sources / delta / done / error`（仅 `pipelineEngine=fixed`） |
+| `POST /knowledge/ask/stream`、`POST /knowledge/sessions/{id}/ask/stream` | `text/event-stream`，支持 `fixed / langchain`，以 `done` 或 `error` 结束 |
 | 文档任务流 | `text/event-stream`，`task` 事件 |
 | `/mcp` | MCP 协议 |
 | Actuator | 端点自身格式 |
@@ -552,10 +555,12 @@ KB 创建者可通过 `/knowledge-bases/{id}/index` 查看索引状态，选择�
 | --- | --- | --- |
 | `GET /knowledge/search` | `query`、`topK=5`、可选 `pipelineEngine` | 当前用户全部可访问库；无历史；只返回检索候选 |
 | `POST /knowledge/ask` | `question`、`topK=5`、可选 `pipelineEngine` | 当前用户全部可访问库；单轮生成 |
-| `POST /knowledge/ask/stream` | 同上 | 同上，SSE 流式；**仅 `pipelineEngine=fixed`**，`langchain` 返回 400 |
+| `POST /knowledge/ask/stream` | 同上 | 当前用户全部可访问库，单轮 SSE |
+| `POST /rag/sessions/{id}/ask` | 会话 ID、`question`、`topK=5`、可选 `pipelineEngine` | 固定的全库或单库范围，可使用最近三轮完成历史 |
+| `POST /knowledge/sessions/{id}/ask/stream` | 同上 | 同一会话范围和历史规则，使用 SSE |
 | `POST /rag/chat` | `knowledgeBaseId`、`conversationId`、`question`、`topK=5`、可选 `pipelineEngine` | 单库、多轮 |
 
-三个入口的问题（`question / query`）均必填，去除首尾空白后长度为 1–4000 个 Unicode 码点；空白判断与 Python `str.strip` 一致，原始问题仍交给下游处理。JSON 的 `question / conversationId / pipelineEngine` 不接受数字、布尔、数组或对象隐式转为字符串，必填字段的 `null` 仍被拒绝。`topK` 省略时为 5，范围为 1–20；JSON 的 `topK` 仅接受整数或 `null`（按默认值处理），小数、布尔和字符串返回 400。`pipelineEngine` 省略或为 `null` 时使用服务默认值，显式值只能为 `fixed / langchain`。非法输入在进入查询业务前返回 400，缺少有效认证的请求先返回 401。
+各入口的问题（`question / query`）均必填，去除首尾空白后长度为 1–4000 个 Unicode 码点；空白判断与 Python `str.strip` 一致，原始问题仍交给下游处理。JSON 的 `question / conversationId / pipelineEngine` 不接受数字、布尔、数组或对象隐式转为字符串，必填字段的 `null` 仍被拒绝。`topK` 省略时为 5，范围为 1–20；JSON 的 `topK` 仅接受整数或 `null`（按默认值处理），小数、布尔和字符串返回 400。显式引擎值为 `fixed / langchain`。同步入口省略引擎时使用服务默认值，SSE 入口沿用 `fixed`。非法输入在进入查询业务前返回 400，缺少有效认证的请求先返回 401。
 
 `chat` 的 `knowledgeBaseId` 必须为 JSON 正整数；`conversationId` 必填，长度 1–128，允许 Unicode 字母、数字和 `._:-`。同一用户、同一库、同一 `conversationId` 复用历史；不同用户或知识库隔离。默认取最近 6 条消息。
 
@@ -574,11 +579,11 @@ $chatBody = @{ knowledgeBaseId = $kbId; conversationId = 'expense-001'; question
 Invoke-RestMethod -Method Post -Uri "$baseUrl/rag/chat" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $chatBody
 ```
 
-多轮示例中的指代需要该会话此前已有上下文。`ask` 不会向 `chat` 会话写入历史。当前 Java 查询接口均返回同步 JSON。
+多轮示例中的指代需要该会话此前已有上下文。公开单轮入口不写会话历史。全库会话绑定创建时的可读库集合，每轮读取历史前后重验该范围，权限变化后需新建会话。会话 SSE 在收到并核对完成终态后才保存该回合，LangChain 的临时增量用于页面展示。
 
 ### 7.2 编排与检索策略
 
-`PythonRagPipeline` 将授权范围、查询、历史及服务端参数一次提交给 Python `POST /rag/query`。Python 完成改写、召回、融合、重排、证据准入、后处理和生成。
+`PythonRagPipeline` 组织授权范围、查询、历史及服务端参数。同步接口提交到 Python `POST /rag/query`，流式接口通过 `RagStreamClient` 转发 `POST /rag/query/stream`。Python 完成改写、召回、融合、重排、证据准入、后处理和生成。
 
 `pipelineEngine` 选择编排实现 `fixed / langchain`；`retrieval.version` 选择检索策略，两者独立：
 

@@ -1,7 +1,7 @@
 """使用 LCEL 装配查询阶段，同时复用固定流程的状态、证据和错误契约。"""
 
 from dataclasses import asdict, dataclass, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
@@ -221,13 +221,13 @@ def _admit_state(state: DocumentState) -> DocumentState:
     return DocumentState(result, tuple(_document(candidate) for candidate in result.admitted))
 
 
-def _postprocess_state(state: DocumentState) -> DocumentState:
+def _postprocess_state(state: DocumentState, *, provisional: bool) -> DocumentState:
     """对获准证据运行共享后处理，并把结果转换为下一阶段可用的 Document。
 
     下游调用 `_candidate`、`ai.app.rag.pipeline.postprocess_query`。
     """
     query = replace(state.query, admitted=[_candidate(document) for document in state.documents])
-    result = steps.postprocess_query(query)
+    result = steps.postprocess_query(query, provisional=provisional)
     return DocumentState(result, tuple(_document(candidate) for candidate in result.admitted))
 
 
@@ -251,24 +251,32 @@ def _generate_state(state: DocumentState) -> DocumentState:
 def _active(node, name):
     """将一个 LCEL 节点包装成仅在当前查询尚无结果时执行的分支。
 
-    上游为 `build_chain`。
+    上游为 `_pre_generation_chain`。
     """
     return RunnableBranch((lambda state: state.query.response is None, RunnableLambda(node, name=name)),
                           RunnablePassthrough())
 
 
-@lru_cache(maxsize=1)
-def build_chain():
-    """按准备、改写、召回、准入、整理、生成和交付的顺序装配 LCEL 问答链。
+@lru_cache(maxsize=2)
+def _pre_generation_chain(*, provisional: bool = False):
+    """装配同步与 SSE 共用的 LCEL 准备、改写、召回、证据准入和上下文整理。
 
-    上游为 `execute`，下游调用 `ai.app.rag.pipeline.prepare_query`、`_active`。
+    上游为 `build_chain`、`prepare_generation`，返回准备完毕或提前终止的 DocumentState。
     """
     return (
         RunnableLambda(lambda request: DocumentState(steps.prepare_query(request)), name="prepare")
         | _active(lambda state: replace(state, query=steps.rewrite_query(state.query)), "rewrite")
         | _active(_retrieve_state, "retrieval")
         | _active(_admit_state, "evidence_gate")
-        | _active(_postprocess_state, "context")
+        | _active(partial(_postprocess_state, provisional=provisional), "context")
+    )
+
+
+@lru_cache(maxsize=1)
+def build_chain():
+    """在共享 LCEL 流程后接入同步生成或纯证据交付，并返回最终查询响应。"""
+    return (
+        _pre_generation_chain()
         | RunnableBranch(
             (lambda state: state.query.response is not None, RunnablePassthrough()),
             (lambda state: not state.query.request.generate,
@@ -276,6 +284,15 @@ def build_chain():
             RunnableLambda(_generate_state, name="generate"))
         | RunnableLambda(lambda state: steps.finish_query(state.query), name="response")
     )
+
+
+def prepare_generation(request: RagQueryRequest) -> QueryState:
+    """在当前请求作用域执行共享 LCEL 流程，向 SSE 入口返回获准证据与生成输入。
+
+    上游为 `ai.app.rag.pipeline._stream_events`。关闭 LangSmith 外部追踪，保留本地阶段收集。
+    """
+    with tracing_context(enabled=False):
+        return _pre_generation_chain(provisional=True).invoke(request).query
 
 
 def execute(request: RagQueryRequest) -> RagQueryResponse:
@@ -295,4 +312,5 @@ def prepare() -> None:
     """
     with tracing_context(enabled=False):
         build_chain()
+        _pre_generation_chain(provisional=True)
         _answer_chain()

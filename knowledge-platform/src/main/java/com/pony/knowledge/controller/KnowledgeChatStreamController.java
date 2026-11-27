@@ -1,4 +1,4 @@
-/* 承接单轮与会话的固定流程问答，将 Python SSE 转发给浏览器。 */
+/* 承接单轮与会话的问答，将 Python SSE 转发给浏览器。 */
 
 package com.pony.knowledge.controller;
 
@@ -20,26 +20,32 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
+import java.io.IOException;
 import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 单轮及会话问答的固定流程 SSE 入口。
+ * 单轮及会话问答的 SSE 入口。
  *
  * <p>会话入口先写入完成回合及获准证据，再发送终态。断连、拒绝执行和上游失败均释放会话租约。
  */
@@ -62,6 +68,7 @@ public class KnowledgeChatStreamController {
     private final Executor sseExecutor;
 
     private final long streamTimeoutMs;
+    private final Map<UUID, SessionStream> activeStreams = new ConcurrentHashMap<>();
 
     private RagSessionService sessions;
 
@@ -74,7 +81,7 @@ public class KnowledgeChatStreamController {
     public void setRagSessions(RagSessionService sessions) { this.sessions = sessions; }
 
     /**
-     * 保存承接单轮与会话的固定流程问答所需的依赖和初始配置。
+     * 保存单轮与会话流式问答所需的依赖和初始配置。
      * 上游为 Spring 组件装配。
      *
      * @param currentUserUtil 本次操作使用的 CurrentUserUtil 组件或记录
@@ -102,7 +109,7 @@ public class KnowledgeChatStreamController {
     }
 
     /**
-     * 解析登录用户的可读范围和页面策略，开启不关联历史的固定流程 SSE。
+     * 解析登录用户的可读范围、引擎和页面策略，开启单轮 SSE。
      * 上游为 HTTP POST /knowledge/ask/stream。
      * 下游为 KnowledgeBaseAccessService.resolveReadableIds、RagStrategy.fromRequest。
      *
@@ -111,20 +118,20 @@ public class KnowledgeChatStreamController {
      */
     @PostMapping(value = "/ask/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter askStream(@Valid @RequestBody KnowledgeChatController.AskRequest request) {
-        validateFixed(request);
+        String engine = requestedStreamEngine(request);
         Integer topKValue = request.getTopK();
         int topK = topKValue == null ? RagInputRules.DEFAULT_TOP_K : topKValue;
         List<Long> knowledgeBaseIds = List.copyOf(
                 knowledgeBaseAccessService.resolveReadableIds(currentUserUtil.getUserId()));
         RagStrategy strategy = RagStrategy.fromRequest(request.getStrategy());
         var queryRequest = strategy == RagStrategy.DEFAULT
-                ? pythonRagPipeline.buildRequest(knowledgeBaseIds, request.getQuestion(), List.of(), topK, true, "fixed")
-                : pythonRagPipeline.buildRequest(knowledgeBaseIds, request.getQuestion(), List.of(), topK, "fixed", strategy);
+                ? pythonRagPipeline.buildRequest(knowledgeBaseIds, request.getQuestion(), List.of(), topK, true, engine)
+                : pythonRagPipeline.buildRequest(knowledgeBaseIds, request.getQuestion(), List.of(), topK, engine, strategy);
         return openStream(queryRequest, null);
     }
 
     /**
-     * 锁定指定会话的当前回合，以会话范围和历史触发固定流程 SSE。
+     * 锁定指定会话的当前回合，用会话范围、历史和所选引擎开启 SSE。
      * 上游为 HTTP POST /knowledge/sessions/{id}/ask/stream。
      * 下游为 RagSessionService.begin、PythonRagPipeline.buildRequest。
      *
@@ -133,32 +140,59 @@ public class KnowledgeChatStreamController {
      * @return 持续发送进度或结果、完成后关闭的 SSE 连接
      */
     @PostMapping(value = "/sessions/{id}/ask/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamSession(@PathVariable UUID id, @Valid @RequestBody KnowledgeChatController.AskRequest request) {
-        validateFixed(request);
+    public SseEmitter streamSession(@PathVariable UUID id, @Valid @RequestBody KnowledgeChatController.AskRequest request,
+                                    HttpServletResponse response) {
+        String engine = requestedStreamEngine(request);
         var lease = sessions.begin(currentUserUtil.getUserId(), id);
         try {
             int topK = request.getTopK() == null ? RagInputRules.DEFAULT_TOP_K : request.getTopK();
             var query = pythonRagPipeline.buildRequest(lease.scope(), request.getQuestion(), sessions.context(lease),
-                    topK, "fixed", RagStrategy.fromRequest(request.getStrategy()));
-            return openStream(query, lease);
+                    topK, engine, RagStrategy.fromRequest(request.getStrategy()));
+            var emitter = openStream(query, lease);
+            response.setHeader("X-Rag-Turn-Id", lease.token().toString());
+            return emitter;
         } catch (RuntimeException failure) {
             releaseLease(lease);
             throw failure;
         }
     }
 
-    /**
-     * 在建立 SSE 前拒绝不支持的引擎选择。
-     * 上游为 KnowledgeChatStreamController.askStream、KnowledgeChatStreamController.streamSession。
-     * 下游为 AskRequest.getPipelineEngine。
-     *
-     * @param request 当前调用的请求参数
-     */
-    private static void validateFixed(KnowledgeChatController.AskRequest request) {
-        String engine = request.getPipelineEngine();
-        if (engine != null && !"fixed".equals(engine)) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "流式问答仅支持 pipelineEngine=fixed");
+    /** 停止指定回合，确认其执行权已释放。旧的取消请求只能作用于原回合。 */
+    @PostMapping("/sessions/{id}/turns/{turnId}/cancel")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void cancelSessionTurn(@PathVariable UUID id, @PathVariable UUID turnId) {
+        long owner = currentUserUtil.getUserId();
+        var active = activeStreams.get(turnId);
+        if (active != null && active.lease().id().equals(id) && active.lease().userId() == owner) {
+            active.stop().run();
         }
+        sessions.end(owner, id, turnId);
+    }
+
+    /** 空闲时也试写 SSE 注释，使代理断开可以在下一次业务事件前被发现。 */
+    @Scheduled(fixedDelay = 500)
+    void checkSessionStreams() {
+        for (var stream : activeStreams.values()) {
+            try {
+                stream.emitter().send(SseEmitter.event().comment("keepalive"));
+            } catch (IOException | IllegalStateException disconnected) {
+                stream.disconnect().run();
+            }
+        }
+    }
+
+    private record SessionStream(RagSessionService.TurnLease lease, SseEmitter emitter,
+                                 Runnable stop, Runnable disconnect) { }
+
+    /**
+     * 读取经 AskRequest 校验的引擎，省略时沿用 SSE 默认的 fixed。
+     * 上游为 KnowledgeChatStreamController.askStream、KnowledgeChatStreamController.streamSession。
+     *
+     * @param request 校验后的流式问答请求
+     * @return 将传给 PythonRagPipeline.buildRequest 的引擎
+     */
+    private static String requestedStreamEngine(KnowledgeChatController.AskRequest request) {
+        return Objects.requireNonNullElse(request.getPipelineEngine(), "fixed");
     }
 
     /**
@@ -176,7 +210,10 @@ public class KnowledgeChatStreamController {
         AtomicBoolean finished = new AtomicBoolean(false);
         AtomicBoolean leaseReleased = new AtomicBoolean(false);
         Runnable release = () -> {
-            if (lease != null && leaseReleased.compareAndSet(false, true)) releaseLease(lease);
+            if (lease != null && leaseReleased.compareAndSet(false, true)) {
+                activeStreams.remove(lease.token());
+                releaseLease(lease);
+            }
         };
 
         // 后台线程在收到事件和终态时更新会话，回调在连接关闭后统一释放回合。
@@ -197,7 +234,7 @@ public class KnowledgeChatStreamController {
                         }
                         try {
                             emitter.send(SseEmitter.event().name(event).data(data));
-                        } catch (java.io.IOException | IllegalStateException sendFailure) {
+                        } catch (IOException | IllegalStateException sendFailure) {
                             closed.set(true);
                             throw sendFailure;
                         }
@@ -238,16 +275,30 @@ public class KnowledgeChatStreamController {
         });
         Runnable cancel = () -> {
             closed.set(true);
-            if (!finished.get()) work.cancel(true);
             release.run();
+            if (!finished.get()) work.cancel(true);
         };
         emitter.onTimeout(cancel);
         emitter.onError(error -> cancel.run());
         emitter.onCompletion(cancel);
 
+        if (lease != null) {
+            // 尽早刷新响应头，停止按钮可在首个模型事件到达前取得回合标识。
+            try {
+                emitter.send(SseEmitter.event().comment("ready"));
+            } catch (IOException failure) {
+                throw new IllegalStateException("无法开启会话问答流", failure);
+            }
+            activeStreams.put(lease.token(), new SessionStream(lease, emitter, () -> {
+                cancel.run();
+                emitter.complete();
+            }, cancel));
+        }
+
         try {
             sseExecutor.execute(work);
         } catch (RejectedExecutionException e) {
+            if (lease != null) activeStreams.remove(lease.token());
             work.cancel(false);
             throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "并发已满，请稍后重试");
         }

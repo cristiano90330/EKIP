@@ -59,4 +59,10 @@ class MinioReclaimPlannerTest {
 
         assertThat(orphans).containsExactly("a.pdf");
     }
+
+    /** 验证过滤空白路径后仍必须有可用引用，才允许产出候选对象。 */
+    @Test
+    void refusesCandidatesWhenAllReferencesAreBlank() {
+        assertThat(MinioReclaimPlanner.findOrphans(List.of("a.pdf"), Set.of("", " "))).isEmpty();
+    }
 }

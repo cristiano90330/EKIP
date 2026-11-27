@@ -115,6 +115,13 @@ def main() -> int:
             if counts["tests"] < 1 or any(counts[key] for key in ("failures", "errors", "skipped")):
                 raise RuntimeError("Incomplete passing evidence for " + suite_name)
         if code == 0:
+            schema = command(["docker", "exec", name, "psql", "-U", "postgres", "-d", db, "-Atc",
+                              "SELECT version FROM flyway_schema_history WHERE success "
+                              "AND version IS NOT NULL ORDER BY installed_rank"]).stdout.split()
+            if "25" not in schema:
+                raise RuntimeError("The disposable database did not apply document task lease migration V25")
+            report["flyway_latest_successful_version"] = schema[-1]
+            report["document_task_lease_migration_applied"] = True
             report["status"] = "passed"
     except Exception as error:
         report["error"] = type(error).__name__ + ": " + str(error)

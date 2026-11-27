@@ -14,6 +14,8 @@ import com.pony.knowledge.service.rag.query.ChatMessage;
 import com.pony.knowledge.utils.CurrentUserUtil;
 import jakarta.servlet.AsyncEvent;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockAsyncContext;
@@ -43,7 +45,7 @@ class KnowledgeChatStreamCancellationTest {
 
     /**
      * 构造 {@code MockMvc} 供测试使用，使用 {@code users.getUserId}、{@code access.resolveReadableIds}。
-     * 由 {@code scopedStreamUsesSavedHistoryAndRecordsOnlyAdmittedEvidence}、{@code transportTimeoutRemainsTimeoutAndNeverEchoesAnUpstreamMessage} 调用。
+     * 由 {@code allLibraryStreamUsesSavedHistoryAndRecordsOnlyAdmittedEvidence}、{@code transportTimeoutRemainsTimeoutAndNeverEchoesAnUpstreamMessage} 调用。
      * @param executor 本用例传入的{@code executor}
      * 返回 {@code MockMvcBuilders.standaloneSetup(controller).build()}。
      */
@@ -60,10 +62,13 @@ class KnowledgeChatStreamCancellationTest {
         return MockMvcBuilders.standaloneSetup(controller).build();
     }
 
-    /** 向指定库会话发送后续问题，确认转发已保存历史且只持久化获准证据。 */
-    @Test void scopedStreamUsesSavedHistoryAndRecordsOnlyAdmittedEvidence() throws Exception {
+    /** 向全库会话发送后续问题，确认两种引擎都使用已保存历史且只持久化获准证据。 */
+    @ParameterizedTest
+    @ValueSource(strings = {"fixed", "langchain"})
+    void allLibraryStreamUsesSavedHistoryAndRecordsOnlyAdmittedEvidence(String engine) throws Exception {
         UUID id = UUID.randomUUID();
-        var lease = new RagSessionService.TurnLease(id, 7L, UUID.randomUUID(), List.of(10L), true);
+        var scope = List.of(10L, 11L);
+        var lease = new RagSessionService.TurnLease(id, 7L, UUID.randomUUID(), scope, false);
         var previous = new ChatMessage();
         previous.setRole("user");
         previous.setContent("previous question");
@@ -71,7 +76,7 @@ class KnowledgeChatStreamCancellationTest {
         query.setQuestion("follow up");
         when(sessions.begin(7L, id)).thenReturn(lease);
         when(sessions.context(lease)).thenReturn(List.of(previous));
-        when(pipeline.buildRequest(List.of(10L), "follow up", List.of(previous), 5, "fixed", RagStrategy.DEFAULT))
+        when(pipeline.buildRequest(scope, "follow up", List.of(previous), 5, engine, RagStrategy.DEFAULT))
                 .thenReturn(query);
         doAnswer(call -> {
             RagStreamClient.FrameHandler output = call.getArgument(1);
@@ -82,7 +87,9 @@ class KnowledgeChatStreamCancellationTest {
         }).when(stream).stream(eq(query), any());
 
         MvcResult result = mvc(Runnable::run).perform(post("/knowledge/sessions/{id}/ask/stream", id)
-                .contentType(MediaType.APPLICATION_JSON).content("{\"question\":\"follow up\"}")).andReturn();
+                .contentType(MediaType.APPLICATION_JSON).content("""
+                        {"question":"follow up","pipelineEngine":"%s"}
+                        """.formatted(engine))).andReturn();
 
         assertTrue(result.getResponse().getContentAsString().contains("event:done"));
         var saved = ArgumentCaptor.forClass(JsonNode.class);
@@ -165,5 +172,75 @@ class KnowledgeChatStreamCancellationTest {
             assertEquals("reusable", executor.submit(() -> "reusable").get(2, TimeUnit.SECONDS));
             assertFalse(result.getResponse().getContentAsString().contains("event:error"));
         } finally { executor.shutdownNow(); }
+    }
+
+    /** 显式中止含临时正文的 LangChain 回合，在取消确认后重发且只保存新回合。 */
+    @Test void cancelledLangchainSessionCanBeRetriedWithoutSavingTheDraft() throws Exception {
+        UUID id = UUID.randomUUID();
+        var lease = new RagSessionService.TurnLease(id, 7L, UUID.randomUUID(), List.of(10L), true);
+        var retryLease = new RagSessionService.TurnLease(id, 7L, UUID.randomUUID(), List.of(10L), true);
+        var query = new AiServiceClient.RagQueryRequest();
+        query.setQuestion("test");
+        query.setPipelineEngine("langchain");
+        when(sessions.begin(7L, id)).thenReturn(lease, retryLease);
+        when(sessions.context(lease)).thenReturn(List.of());
+        when(sessions.context(retryLease)).thenReturn(List.of());
+        when(pipeline.buildRequest(List.of(10L), "test", List.of(), 5, "langchain", RagStrategy.DEFAULT))
+                .thenReturn(query);
+        CountDownLatch partial = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        doAnswer(call -> {
+            var output = call.<RagStreamClient.FrameHandler>getArgument(1);
+            output.onFrame("delta", """
+                    {"text":"draft","provisional":true}
+                    """);
+            partial.countDown();
+            try {
+                new CountDownLatch(1).await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException cancelled) {
+                interrupted.countDown();
+                Thread.currentThread().interrupt();
+            }
+            return null;
+        }).doAnswer(call -> {
+            var output = call.<RagStreamClient.FrameHandler>getArgument(1);
+            output.onFrame("done", """
+                    {"outcome":"success","answer":"complete","pipelineEngine":"langchain",
+                    "sources":[{"chunkId":1}],"evidenceSources":[{"chunkId":2}]}
+                    """);
+            return null;
+        }).when(stream).stream(eq(query), any());
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            MockMvc mvc = mvc(executor);
+            MvcResult first = mvc.perform(post("/knowledge/sessions/{id}/ask/stream", id)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("{\"question\":\"test\",\"pipelineEngine\":\"langchain\"}")).andReturn();
+            assertTrue(partial.await(2, TimeUnit.SECONDS));
+            assertTrue(first.getResponse().getContentAsString().contains("\"provisional\":true"));
+            verify(sessions, never()).complete(eq(lease), anyString(), any());
+            assertEquals(lease.token().toString(), first.getResponse().getHeader("X-Rag-Turn-Id"));
+            MvcResult cancel = mvc.perform(post("/knowledge/sessions/{id}/turns/{turnId}/cancel", id, lease.token()))
+                    .andReturn();
+            assertEquals(204, cancel.getResponse().getStatus());
+            assertTrue(interrupted.await(2, TimeUnit.SECONDS));
+            verify(sessions).end(lease);
+            verify(sessions).end(7L, id, lease.token());
+
+            MvcResult retry = mvc.perform(post("/knowledge/sessions/{id}/ask/stream", id)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("{\"question\":\"test\",\"pipelineEngine\":\"langchain\"}")).andReturn();
+            assertNull(retry.getAsyncResult(2000));
+            assertTrue(retry.getResponse().getContentAsString().contains("event:done"));
+            var saved = ArgumentCaptor.forClass(JsonNode.class);
+            verify(sessions).complete(eq(retryLease), eq("test"), saved.capture());
+            assertEquals("complete", saved.getValue().path("answer").asText());
+            assertEquals("langchain", saved.getValue().path("pipelineEngine").asText());
+            assertEquals(2, saved.getValue().path("sources").get(0).path("chunkId").asInt());
+            verify(sessions, never()).complete(eq(lease), anyString(), any());
+        } finally {
+            executor.shutdownNow();
+        }
     }
 }

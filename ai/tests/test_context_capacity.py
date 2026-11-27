@@ -114,11 +114,74 @@ def test_batch_extracts_are_rechecked_together_not_admitted_individually():
     with model_execution(execution()), context_progress(progress.append):
         result = support.review(QUESTION, [], sources, monotonic() + 10, caller=caller)
     assert 2 <= len(extracts) <= 4
+    original_batches = {index for index, quotes in enumerate(extracts)
+                        if any(item["quote"] == FACT for item in quotes)}
+    contrary_batches = {index for index, quotes in enumerate(extracts)
+                        if any(item["quote"] == contrary for item in quotes)}
+    assert original_batches and contrary_batches
+    assert original_batches.isdisjoint(contrary_batches)
     assert result.state == "rejected", result.reason_code
     assert result.required_spans == []
     assert calls[-1] == support.SUPPORT_SYSTEM
     assert progress[-1]["method"] == "batch_extract"
     assert progress[-1]["batchCount"] == len(extracts)
+
+
+def test_new_long_document_combines_verbatim_evidence_from_separate_batches():
+    """两批长文中的独立问答要点均被复核，获准引用仍来自两份原始资料。"""
+    question = "雾岬站的盐雾样本交接时，接收人应核对什么，以及归档由谁负责？"
+    facts = (
+        "雾岬站交接盐雾样本时，接收人应核对封签编号和温度读数。",
+        "雾岬站盐雾样本完成交接后，由巡检组负责归档。",
+    )
+    noise = "\n\n".join(
+        f"第{i}处库位的备品须填写领用记录，领取后将包装材料交还管理处。"
+        for i in range(170)
+    )
+    sources = [
+        Candidate(index, index, 1, 0, fact + "\n\n" + noise)
+        for index, fact in enumerate(facts, 21)
+    ]
+    extracts, progress = [], []
+
+    def caller(system, user, deadline):
+        if system == support.DECOMPOSITION_SYSTEM:
+            return reply({
+                "resolved": True, "execution_requirements": [], "standalone_question": question,
+                "elements": [
+                    {"id": "E1", "text": "雾岬站盐雾样本交接时接收人应核对的项目"},
+                    {"id": "E2", "text": "雾岬站盐雾样本归档负责人"},
+                ],
+            })
+        if system == support.EXTRACT_SYSTEM:
+            payload = json.JSONDecoder().raw_decode(user[user.index("{"):])[0]
+            quotes = [{"source_index": source["source_index"], "quote": fact}
+                      for source in payload["sources"]
+                      for fact in facts if fact in source["content"]]
+            extracts.append({quote["source_index"] for quote in quotes})
+            return reply({"complete": True, "quotes": quotes})
+
+        assert system == support.SUPPORT_SYSTEM
+        assert all(fact in user for fact in facts)
+        return reply({
+            "alignment": "两处条文分别说明核对项目与归档负责人。",
+            "question_fully_covered": True,
+            "elements": [
+                {"supported": True, "citations": [{"source_index": index, "quote": fact}]}
+                for index, fact in enumerate(facts, 1)
+            ],
+        })
+
+    with model_execution(execution()), context_progress(progress.append):
+        result = support.review(question, [], sources, monotonic() + 10, caller=caller)
+
+    assert {1} in extracts and {2} in extracts and {1, 2} not in extracts
+    assert progress[-1]["method"] == "batch_extract"
+    assert (result.state, result.reason_code) == ("accepted", "all_elements_supported")
+    assert result.required_source_ids == [21, 22]
+    assert result.required_spans == [
+        {"source_id": index, "content": fact} for index, fact in enumerate(facts, 21)
+    ]
 
 
 def test_required_question_does_not_fit_and_never_calls_model():

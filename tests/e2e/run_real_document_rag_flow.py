@@ -1,10 +1,10 @@
 # 在隔离依赖中走通真实 PDF 入库与检索，或记录解析失败后的回执、删除和清理结果。
 
-"""Verify a real PDF or a parser failure with isolated Java, AI, PG, Redis and MinIO.
+"""Verify document ingestion and failure boundaries with isolated Java, AI, PG, Redis and MinIO.
 
-The only non-isolated dependency is the explicitly selected local Ollama model
-endpoint. All business data and uploaded objects live in one-off containers
-backed by tmpfs and are removed when this process exits.
+The PDF success scenario calls a selected local Ollama model. The format suite
+uses a deterministic embedding HTTP fixture. Uploaded objects and database rows
+live in one-off containers backed by tmpfs.
 """
 
 from __future__ import annotations
@@ -22,7 +22,10 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -175,19 +178,21 @@ def data_of(response: Any) -> Any:
 
 
 def verify_parser_failure(api: Any, pg_container: str, minio: Minio,
-                          bucket: str, kb_id: int, report: dict[str, Any]) -> None:
+                          bucket: str, kb_id: int, report: dict[str, Any], *,
+                          filename: str = "parser-failure.pdf",
+                          content: bytes = b"%PDF-1.7\nV03 deliberately malformed PDF without a document catalog.\n",
+                          mime: str = "application/pdf") -> None:
     """上传损坏文件并等待解析失败，核对回执和零入库结果，再验证删除后的数据库与对象状态。
 
     上游为 `main`，下游调用 `data_of`、`api`。
     """
-    invalid_pdf = b"%PDF-1.7\nV03 deliberately malformed PDF without a document catalog.\n"
     request_key = f"parser-failure-{uuid.uuid4()}"
-    report["file"] = "parser-failure.pdf"
-    report["fileSha256"] = hashlib.sha256(invalid_pdf).hexdigest()
+    report["file"] = filename
+    report["fileSha256"] = hashlib.sha256(content).hexdigest()
     receipt = data_of(api(
         "POST", "/document/upload", params={"knowledgeBaseId": kb_id},
         headers={"Idempotency-Key": request_key},
-        files={"file": ("parser-failure.pdf", invalid_pdf, "application/pdf")},
+        files={"file": (filename, content, mime)},
     ))
     document_id = int(receipt["documentId"])
     report["documentId"] = document_id
@@ -209,8 +214,8 @@ def verify_parser_failure(api: Any, pg_container: str, minio: Minio,
         "errorCode": task.get("errorCode"),
     }
     if str(task.get("status", "")).upper() != "FAILED" or task.get("errorCode") != "DOCUMENT_INVALID":
-        raise RuntimeError(f"Invalid PDF did not produce DOCUMENT_INVALID failure: {report['task']}")
-    report["checks"]["parserRejectedInvalidPdf"] = True
+        raise RuntimeError(f"{filename} did not produce DOCUMENT_INVALID failure: {report['task']}")
+    report["checks"]["parserRejectedInvalidPdf" if mime == "application/pdf" else "parserRejectedInvalidFormat"] = True
 
     def database_snapshot() -> dict[str, Any]:
         """查询当前样本文档相关的数据库行，供报告核对失败后的入库与清理状态。
@@ -226,8 +231,10 @@ def verify_parser_failure(api: Any, pg_container: str, minio: Minio,
             f"'taskStatus',(SELECT status FROM document_task WHERE document_id={document_id} ORDER BY id DESC LIMIT 1),"
             f"'chunkCount',(SELECT count(*) FROM document_chunk WHERE document_id={document_id}),"
             "'vectorCount',"
-            f"(SELECT count(*) FROM document_chunk_vector_1024 WHERE knowledge_base_id={kb_id})+"
-            f"(SELECT count(*) FROM document_chunk_vector_2560 WHERE knowledge_base_id={kb_id}),"
+            f"(SELECT count(*) FROM document_chunk_vector_1024 WHERE chunk_id IN "
+            f"(SELECT id FROM document_chunk WHERE document_id={document_id}))+"
+            f"(SELECT count(*) FROM document_chunk_vector_2560 WHERE chunk_id IN "
+            f"(SELECT id FROM document_chunk WHERE document_id={document_id})),"
             "'receiptCount',"
             f"(SELECT count(*) FROM document_upload_receipt WHERE document_id={document_id}));"
         )
@@ -247,7 +254,7 @@ def verify_parser_failure(api: Any, pg_container: str, minio: Minio,
 
     object_name = failed_state["objectName"]
     stored_object = minio.stat_object(bucket, object_name)
-    if stored_object.size != len(invalid_pdf):
+    if stored_object.size != len(content):
         raise RuntimeError("Failed document's original object was not preserved intact")
     report["checks"]["originalObjectRetainedAfterParserFailure"] = True
 
@@ -276,13 +283,165 @@ def verify_parser_failure(api: Any, pg_container: str, minio: Minio,
     report["checks"]["failedDocumentOriginalObjectDeleted"] = True
 
 
+def start_embedding_fixture() -> tuple[ThreadingHTTPServer, Thread, Event, Event]:
+    """在隔离端口提供固定向量，并暂停 DOCX 向量响应以观察真实任务续租。"""
+    entered, release = Event(), Event()
+
+    class Embeddings(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            if self.path != "/v1/embeddings":
+                self.send_error(404)
+                return
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            texts = request["input"]
+            if any("V03-LEASE-DOCX" in text for text in texts):
+                entered.set()
+                if not release.wait(45):
+                    self.send_error(504)
+                    return
+            vector = [1.0] + [0.0] * 1023
+            response = json.dumps({"data": [{"index": i, "embedding": vector} for i in range(len(texts))]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Embeddings)
+    runner = Thread(target=server.serve_forever, name="isolated-embedding-fixture", daemon=True)
+    runner.start()
+    return server, runner, entered, release
+
+
+def office_fixtures() -> list[tuple[str, str, str, bytes]]:
+    """生成带有不同标记的合成 DOCX、XLSX 和 PPTX，供上传 API 验证。"""
+    from docx import Document
+    from openpyxl import Workbook
+    from pptx import Presentation
+
+    word = Document()
+    word.add_heading("Lease fixture", level=1)
+    word.add_paragraph("V03-LEASE-DOCX")
+    excel = Workbook()
+    excel.active.append(["Name", "Value"])
+    excel.active.append(["fixture", "V03-TABLE-XLSX"])
+    slides = Presentation()
+    slide = slides.slides.add_slide(slides.slide_layouts[1])
+    slide.shapes.title.text = "Slide fixture"
+    slide.placeholders[1].text = "V03-TEXT-PPTX"
+    fixtures = []
+    for extension, subtype, marker, content in (
+        ("docx", "wordprocessingml.document", "V03-LEASE-DOCX", word),
+        ("xlsx", "spreadsheetml.sheet", "V03-TABLE-XLSX", excel),
+        ("pptx", "presentationml.presentation", "V03-TEXT-PPTX", slides),
+    ):
+        stream = BytesIO()
+        content.save(stream)
+        fixtures.append((f"isolated.{extension}", f"application/vnd.openxmlformats-officedocument.{subtype}",
+                         marker, stream.getvalue()))
+    return fixtures
+
+
+def verify_office_formats(api: Any, pg_container: str, minio: Minio, bucket: str, kb_id: int,
+                          report: dict[str, Any], embed_started: Event, embed_release: Event) -> None:
+    """验证 Office 入库、活动索引、处理中续租以及损坏文件的失败和清理。"""
+    def pg_json(sql: str) -> Any:
+        return json.loads(run(["docker", "exec", pg_container, "psql", "-U", "postgres",
+                               "-d", "knowledge_test", "-Atc", sql], timeout=10).stdout)
+
+    migrations = pg_json("""
+        SELECT json_agg(version ORDER BY installed_rank) FROM flyway_schema_history
+        WHERE version IS NOT NULL AND success
+    """)
+    if "25" not in migrations:
+        raise RuntimeError("Document task lease migration V25 was not applied")
+    report["flywayLatestSuccessfulVersion"] = migrations[-1]
+    report["checks"]["leaseMigrationApplied"] = True
+    report["formats"] = {}
+    fixtures = office_fixtures()
+    for name, mime, marker, content in fixtures:
+        receipt = data_of(api("POST", "/document/upload", params={"knowledgeBaseId": kb_id},
+                              headers={"Idempotency-Key": f"format-{uuid.uuid4()}"},
+                              files={"file": (name, content, mime)}))
+        document_id = int(receipt["documentId"])
+        task_id = int(receipt["taskId"])
+        if name.endswith(".docx"):
+            try:
+                if not embed_started.wait(20):
+                    raise RuntimeError("DOCX did not reach the embedding transport fixture")
+                lease_sql = f"""
+                    SELECT json_build_object('status', status, 'attempt', total_attempt_count,
+                        'expires', extract(epoch FROM lease_expires_at),
+                        'hardDeadline', extract(epoch FROM lease_deadline_at),
+                        'leaseRemaining', extract(epoch FROM (lease_expires_at - clock_timestamp())),
+                        'hardDeadlineRemaining', extract(epoch FROM (lease_deadline_at - clock_timestamp())))
+                    FROM document_task WHERE id={task_id}
+                """
+                initial = pg_json(lease_sql)
+                if (initial["status"] != 1 or not 100 < initial["leaseRemaining"] <= 120
+                        or not 580 < initial["hardDeadlineRemaining"] <= 600):
+                    raise RuntimeError("DOCX did not hold a processing lease with the default budget")
+
+                def renewed_lease() -> dict[str, Any] | None:
+                    current = pg_json(lease_sql)
+                    if current["attempt"] != initial["attempt"] or current["hardDeadline"] != initial["hardDeadline"]:
+                        raise RuntimeError("Renewal changed the attempt or hard deadline")
+                    return current if current["expires"] > initial["expires"] else None
+
+                renewed = wait_until("document lease renewal", renewed_lease, 30, .5)
+                elapsed = round(renewed["expires"] - initial["expires"], 2)
+                if not 18 <= elapsed <= 30:
+                    raise RuntimeError(f"Unexpected lease renewal interval: {elapsed}s")
+                report["lease"] = {"observedRenewalSeconds": elapsed,
+                                   "initialLeaseRemainingSeconds": round(initial["leaseRemaining"], 2),
+                                   "initialHardDeadlineRemainingSeconds": round(initial["hardDeadlineRemaining"], 2)}
+                report["checks"]["processingLeaseRenewed"] = True
+            finally:
+                embed_release.set()
+
+        def terminal_task() -> dict[str, Any] | None:
+            task = data_of(api("GET", f"/document/{document_id}/task"))
+            return task if str(task.get("status", "")).lower() in {"success", "failed", "cancelled"} else None
+
+        task = wait_until(f"{name} terminal state", terminal_task, 90)
+        if str(task.get("status", "")).lower() != "success":
+            raise RuntimeError(f"{name} did not ingest successfully: {task.get('errorCode')}")
+        records = data_of(api("GET", f"/document/{document_id}/chunks", params={"page": 1, "size": 100}))["records"]
+        if not any(marker in item["content"] for item in records):
+            raise RuntimeError(f"{name} did not preserve the expected source text")
+        persisted = pg_json(f"""
+            SELECT json_build_object('mime', file_type, 'object', file_path,
+                'activeVectors', (SELECT count(*) FROM document_chunk_vector_1024 v
+                    JOIN knowledge_index_binding b ON b.knowledge_base_id=v.knowledge_base_id
+                        AND b.active_generation_id=v.generation_id
+                    JOIN document_chunk c ON c.id=v.chunk_id WHERE c.document_id=d.id),
+                'leaseCleared', (SELECT lease_expires_at IS NULL AND lease_deadline_at IS NULL
+                    FROM document_task WHERE id={task_id}))
+            FROM document d WHERE id={document_id}
+        """)
+        if (persisted["mime"] != mime or not persisted["activeVectors"] or not persisted["leaseCleared"]
+                or minio.stat_object(bucket, persisted["object"]).size != len(content)):
+            raise RuntimeError(f"{name} did not persist its MIME, original object, vectors and lease terminal state")
+        report["formats"][name] = {"chunkCount": len(records), "activeVectors": persisted["activeVectors"],
+                                   "leaseCleared": persisted["leaseCleared"], "documentId": document_id}
+
+    failure = dict(checks={})
+    report["corruptFormat"] = failure
+    verify_parser_failure(api, pg_container, minio, bucket, kb_id, failure, filename="broken.docx",
+                          content=b"deliberately corrupt Office archive", mime=fixtures[0][1])
+    report["checks"]["officeFormatsAndFailureBoundaryVerified"] = True
+
+
 def main() -> int:
     """构造真实 PDF 或损坏文件场景的隔离环境，记录解析、索引、查询与删除结果。
 
     下游调用 `isolated_ports`、`require_image`。
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=("success", "parser-failure"), default="success")
+    parser.add_argument("--scenario", choices=("success", "parser-failure", "office-formats"), default="success")
     parser.add_argument("--file", type=Path, default=DEFAULT_PDF, help="PDF to upload; defaults to the travel reimbursement fixture")
     parser.add_argument(
         "--query",
@@ -304,7 +463,7 @@ def main() -> int:
         raise SystemExit("Ollama endpoint must use localhost or a loopback IP address")
 
     pdf = args.file.resolve()
-    if not pdf.is_file() or pdf.suffix.lower() != ".pdf":
+    if args.scenario == "success" and (not pdf.is_file() or pdf.suffix.lower() != ".pdf"):
         raise SystemExit(f"Input must be an existing PDF: {pdf}")
 
     log_root = ROOT / "logs" / "real-document-rag-flow"
@@ -325,17 +484,18 @@ def main() -> int:
     password = f"T{secrets.token_urlsafe(12)}!"
     java_process: subprocess.Popen[bytes] | None = None
     ai_process: subprocess.Popen[bytes] | None = None
+    embedding_fixture: tuple[ThreadingHTTPServer, Thread, Event, Event] | None = None
     started_containers: list[str] = []
     report: dict[str, Any] = {
         "runId": run_id,
         "scenario": args.scenario,
-        "file": str(pdf.relative_to(ROOT)) if pdf.is_relative_to(ROOT) else pdf.name,
-        "fileSha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
-        "embeddingModel": args.embedding_model,
-        "query": args.query,
         "isolation": {"containers": names, "ports": ports, "storage": "tmpfs"},
         "checks": {},
     }
+    if args.scenario == "success":
+        report.update(file=str(pdf.relative_to(ROOT)) if pdf.is_relative_to(ROOT) else pdf.name,
+                      fileSha256=hashlib.sha256(pdf.read_bytes()).hexdigest(),
+                      embeddingModel=args.embedding_model, query=args.query)
 
     def cleanup() -> None:
         """关闭本次真实文档流程使用的临时客户端、应用进程及依赖容器。
@@ -368,6 +528,9 @@ def main() -> int:
             if args.embedding_model not in available_models:
                 raise RuntimeError(f"Ollama model is not available locally: {args.embedding_model}")
             report["checks"]["ollamaModelAvailable"] = True
+        if args.scenario == "office-formats":
+            embedding_fixture = start_embedding_fixture()
+            report["embeddingBoundary"] = "deterministic HTTP fixture"
 
         start_container(
             names["pg"], POSTGRES_IMAGE,
@@ -441,7 +604,15 @@ def main() -> int:
             "AI_BASE_URL": f"http://127.0.0.1:{ports['ai']}",
             "RETRIEVAL_VERSION": "baseline",
             "TASK_RELIABILITY_RECOVERY_ENABLED": "false",
+            "MODEL_RESOURCE_REDIS_URL": "",
+            "OTEL_ENABLED": "false",
         })
+        if embedding_fixture is not None:
+            common_env.update({
+                "TASK_RELIABILITY_LEASE_RENEW_INTERVAL_MS": "20000",
+                "TASK_RELIABILITY_LEASE_DURATION_MS": "120000",
+                "TASK_RELIABILITY_STUCK_TIMEOUT_MS": "600000",
+            })
 
         mvnw = ROOT / "knowledge-platform" / "mvnw.cmd"
         java_process = start_process(
@@ -468,6 +639,7 @@ def main() -> int:
             "MINIO_BUCKET": bucket,
             "INTERNAL_API_TOKEN": internal_token,
             "RETRIEVAL_LEG_TIMEOUT_MS": "10000",
+            "RAG_DEV_TEST_MODE": "false",
         })
         ai_process = start_process(
             [sys.executable, "-m", "uvicorn", "ai.app.main:app", "--host", "127.0.0.1", "--port", str(ports["ai"])],
@@ -496,14 +668,16 @@ def main() -> int:
                 raise RuntimeError("Isolated account login response did not contain a token")
             client.headers["Authorization"] = f"Bearer {token}"
 
+            embedding_url = (args.ollama_base_url if embedding_fixture is None
+                             else f"http://127.0.0.1:{embedding_fixture[0].server_address[1]}/v1")
             model = data_of(api("POST", "/models", json={
                 "name": f"realflow-{run_id}",
                 "type": "embedding",
                 "source": "local",
                 "provider": "ollama",
                 "protocol": "openai_embedding",
-                "model": args.embedding_model,
-                "baseUrl": args.ollama_base_url,
+                "model": args.embedding_model if embedding_fixture is None else "deterministic-office-fixture",
+                "baseUrl": embedding_url,
                 "dimension": 1024,
                 "contextWindow": 4096,
                 "capabilities": {},
@@ -527,6 +701,9 @@ def main() -> int:
 
             if args.scenario == "parser-failure":
                 verify_parser_failure(api, names["pg"], minio, bucket, kb_id, report)
+            elif embedding_fixture is not None:
+                verify_office_formats(api, names["pg"], minio, bucket, kb_id, report,
+                                      embedding_fixture[2], embedding_fixture[3])
             else:
                 idempotency_key = f"realflow-{uuid.uuid4()}"
                 with pdf.open("rb") as source:
@@ -616,6 +793,12 @@ def main() -> int:
         return_code = 1
     finally:
         try:
+            if embedding_fixture is not None:
+                server, runner, _, release = embedding_fixture
+                release.set()
+                server.shutdown()
+                server.server_close()
+                runner.join(timeout=5)
             cleanup()
             report["checks"]["isolatedCleanupSucceeded"] = True
         except Exception as cleanup_error:

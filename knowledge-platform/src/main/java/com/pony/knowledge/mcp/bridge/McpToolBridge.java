@@ -12,6 +12,7 @@ import com.pony.knowledge.agent.tool.ToolExecutor;
 import com.pony.knowledge.agent.tool.ToolRegistry;
 import com.pony.knowledge.agent.tool.output.ToolResult;
 import com.pony.knowledge.mcp.config.McpProperties;
+import com.pony.knowledge.modelmanagement.ModelExecutionContext;
 import com.pony.knowledge.service.KnowledgeBaseAccessService;
 import io.modelcontextprotocol.server.McpServerFeatures;
 import io.modelcontextprotocol.server.McpSyncServerExchange;
@@ -152,7 +153,10 @@ public class McpToolBridge {
                 .arguments(argumentsJson)
                 .build();
 
-        return toCallResult(toolExecutor.execute(call, context));
+        // 工具线程复用已认证 Key 的账号解析模型，执行快照仍由实际调用需求决定。
+        try (ModelExecutionContext ignored = ModelExecutionContext.open(null, userId)) {
+            return toCallResult(toolExecutor.execute(call, context));
+        }
     }
 
     /**

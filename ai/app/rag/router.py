@@ -16,7 +16,7 @@ from ai.app.retrieval.db import ReadOnlyPgError
 from ai.app.models.resolution import ModelConfigurationError
 from ai.app.security import is_internal_token_valid
 from ai.app.llm.context_input import context_progress
-from ai.app.models.cancellation import cancellation_scope, check_cancelled
+from ai.app.models.cancellation import cancellation_scope, check_cancelled, current_cancellation_event
 
 router = APIRouter(prefix="/rag", tags=["rag"])
 _stream_workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rag-progress")
@@ -26,15 +26,18 @@ _stream_slots = BoundedSemaphore(4)
 def _progress_stream(request):
     """用有界队列连接提交问答的工作线程与 SSE 消费者，使长上下文整理能提前报告进展。
 
-    上游为 `rag_query_stream`，下游调用 `ai.app.models.cancellation.check_cancelled`。
+    上游为 `rag_query_stream`。工作线程继承请求取消信号，断连时停止生成和 SSE 消费。
     """
+    stopped = current_cancellation_event() or Event()
+    if stopped.is_set():
+        return
     if not _stream_slots.acquire(blocking=False):
         yield {"event": "error", "data": {"outcome": "dependency_unavailable",
                "reasonCode": "query_capacity_exceeded"}}
         return
 
     # 将模型工作线程和流式消费者解耦，让证据整理期间的进度能够及时发送，并对积压事件设上限。
-    queue, stopped, context = Queue(maxsize=16), Event(), copy_context()
+    queue, context = Queue(maxsize=16), copy_context()
 
     def put(item):
         """将问答事件放入流式队列，在浏览器断连或流终止后退出等待。
@@ -77,13 +80,12 @@ def _progress_stream(request):
         _stream_slots.release()
         raise
     try:
-        while True:
-            check_cancelled()
+        while not stopped.is_set():
             try:
                 kind, value = queue.get(timeout=0.1)
             except Empty:
                 continue
-            if kind == "end":
+            if stopped.is_set() or kind == "end":
                 return
             if kind == "error":
                 raise value
@@ -168,8 +170,8 @@ def encode_sse(event: dict) -> str:
 def rag_query_stream(request: RagQueryRequest):
     """先调用 run_query_stream 执行入口校验，再由 StreamingResponse 惰性迭代事件并推送。
 
-    当前流式编排仅支持 fixed；HTTP 响应开始前的参数错误返回 400，开始后由管线的 done 或 error
-    终止事件表达结果，部分 delta 或 HTTP 200 都不代表答案已经完成。
+    HTTP 响应开始前的参数错误返回 400。fixed 和 LangChain 都以 done 或 error 表达终态，
+    LangChain 的正文 delta 只供客户端在完成前预览。
     """
     try:
         run_query_stream(request)  # Keep validation before response headers.

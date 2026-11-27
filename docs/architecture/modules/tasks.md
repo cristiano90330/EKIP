@@ -14,4 +14,6 @@ Java 负责解析任务的投递、执行、恢复、终态写入与状态通知
 
 默认每 20 秒续租，租期为 120 秒，单次执行硬上限为 10 分钟。租约失效后，下一次扫描或已有投递可接手。自动重试先保存退避到期时间，再安排本地投递；节点退出后，其他节点可在到期后恢复。新的累计尝试号能阻止旧工作线程的结果和旧重试回调覆盖当前状态。
 
+续租确认当前尝试已失效后，持有该尝试的 Java 节点关闭本次解析连接。Python 收到断连后，在下载完成、格式解析、PDF 分页和文本切块等检查点退出，并结束本次所启动的 OCR 或 Office 转换子进程。检测延迟取决于续租调度，第三方阻塞调用可能继续到下一个检查点。数据库的尝试身份校验保护最后的入库边界。 [取消传输](../../../knowledge-platform/src/main/java/com/pony/knowledge/service/ai/DocumentParseCancellation.java) · [解析入口](../../../ai/app/parser/router.py)
+
 首次升级须先停止所有旧版后端工作节点，再应用 `V25` 并启动新版。升级时无租约的旧 `PROCESSING` 任务进入恢复范围。各新版节点使用同一个主库；Redis 广播按页面通知需求另行启用。[租约迁移](../../../knowledge-platform/src/main/resources/db/migration/V25__document_task_leases.sql)

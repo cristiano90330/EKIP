@@ -316,7 +316,7 @@ class CoreBusinessFlowIntegrationTest {
     private void stubExternalBoundaries() throws Exception {
         when(modelRuntime.resolve(anyMap())).thenReturn(Map.of());
         when(files.upload(any(MultipartFile.class))).thenAnswer(call -> "test-object-" + UUID.randomUUID());
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString())).thenAnswer(call -> {
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any())).thenAnswer(call -> {
             long documentId = call.getArgument(0);
             String name = jdbc.queryForObject("SELECT file_name FROM document WHERE id=?", String.class, documentId);
             if ("invalid.pdf".equals(name)) {

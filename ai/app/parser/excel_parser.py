@@ -7,7 +7,9 @@ from typing import List
 import xlrd
 from openpyxl import load_workbook
 
+from ai.app.models.cancellation import check_cancelled
 from ai.app.parser.blocks import Block, BlockType
+from ai.app.rag.deadline import QueryDeadlineExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,7 @@ def _formula_cells_without_cache(path: str) -> int:
         scanned = 0
         for sheet in workbook.worksheets:
             for row in sheet.iter_rows():
+                check_cancelled()
                 for cell in row:
                     scanned += 1
                     if scanned > _PROBE_MAX_CELLS:
@@ -42,6 +45,8 @@ def _formula_cells_without_cache(path: str) -> int:
                     if isinstance(value, str) and value.startswith("="):
                         total += 1
         return total
+    except QueryDeadlineExceeded:
+        raise
     except Exception:                              # noqa: BLE001
         return 0
     finally:
@@ -60,9 +65,12 @@ def _extract_xlsx(path: str) -> List[Block]:
         try:
             blocks: List[Block] = []
             for sheet in workbook.worksheets:
-                rows = [[(cell.value if cell.value is not None else "") for cell in row]
-                        for row in sheet.iter_rows()]
-                rows = [row for row in rows if any(str(cell).strip() for cell in row)]
+                rows = []
+                for row in sheet.iter_rows():
+                    check_cancelled()
+                    values = [cell.value if cell.value is not None else "" for cell in row]
+                    if any(str(cell).strip() for cell in values):
+                        rows.append(values)
                 if rows:
                     blocks.append(Block(type=BlockType.TABLE, text="", table_id=sheet.title, rows=rows))
             return blocks
@@ -101,9 +109,12 @@ def _extract_xls(path: str) -> List[Block]:
     book = xlrd.open_workbook(path)
     blocks: List[Block] = []
     for sheet in book.sheets():
-        rows = [[_xls_cell(book, sheet, row, column) for column in range(sheet.ncols)]
-                for row in range(sheet.nrows)]
-        rows = [row for row in rows if any(str(cell).strip() for cell in row)]
+        rows = []
+        for row in range(sheet.nrows):
+            check_cancelled()
+            values = [_xls_cell(book, sheet, row, column) for column in range(sheet.ncols)]
+            if any(str(cell).strip() for cell in values):
+                rows.append(values)
         if rows:
             blocks.append(Block(type=BlockType.TABLE, text="", table_id=sheet.name, rows=rows))
     return blocks

@@ -8,9 +8,11 @@ from fastapi import APIRouter, HTTPException
 
 from ai.app.config import CHUNK_OVERLAP, CHUNK_SIZE
 from ai.app.llm.telemetry import get_request_id
+from ai.app.models.cancellation import check_cancelled
 from ai.app.parser.errors import DocumentInputError, PdfOcrUnavailable
 from ai.app.parser.pipeline import parse_local_document
 from ai.app.parser.schema import ParseObjectRequest
+from ai.app.rag.deadline import QueryDeadlineExceeded
 from ai.app.service.minio_service import MinioService
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,7 @@ def _object_flow(request: ParseObjectRequest):
     """
     temp_path = None
     try:
+        check_cancelled()
         # 先拿到临时路径并关闭句柄，让下载器和各格式解析器依次按路径读取。
         with tempfile.NamedTemporaryFile(suffix=f".{request.fileExtension}", delete=False) as temp:
             temp_path = temp.name
@@ -44,6 +47,7 @@ def _object_flow(request: ParseObjectRequest):
 
         try:
             # 下载成功后再进入格式解析。两类失败使用不同 HTTP 状态，便于 Java 判断是否需要重试。
+            check_cancelled()
             chunks = parse_local_document(
                 temp_path,
                 request.fileExtension,
@@ -57,7 +61,11 @@ def _object_flow(request: ParseObjectRequest):
         except PdfOcrUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+        check_cancelled()
         return {"documentId": request.documentId, "chunks": chunks}
+    except QueryDeadlineExceeded as exc:
+        # 当前请求已断开。正常连接上的输入错误和依赖故障继续保留各自的状态。
+        raise HTTPException(status_code=499, detail="文档解析请求已取消") from exc
     finally:
         # 原文件只作为本次请求的中间文件，返回或异常退出都需要清理。
         if temp_path and os.path.exists(temp_path):

@@ -9,12 +9,16 @@ import com.pony.knowledge.service.ai.AiServiceClient;
 import com.pony.knowledge.service.rag.ConversationService;
 import com.pony.knowledge.service.rag.PythonRagPipeline;
 import com.pony.knowledge.service.rag.RagService;
+import com.pony.knowledge.service.rag.RagSessionService;
 import com.pony.knowledge.service.rag.RagStreamClient;
+import com.pony.knowledge.service.rag.query.ChatMessage;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.pony.knowledge.utils.CurrentUserUtil;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.micrometer.observation.ObservationRegistry;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
@@ -22,6 +26,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -36,6 +41,7 @@ class RagPipelineSelectionControllerTest {
     private final ConversationService conversations = mock(ConversationService.class);
     private final TraceStore traceStore = mock(TraceStore.class);
     private final RagStreamClient streamClient = mock(RagStreamClient.class);
+    private final RagSessionService sessions = mock(RagSessionService.class);
 
     /**
      * 构造 {@code MockMvc} 供测试使用，使用 {@code user.getUserId}、{@code access.resolveReadableIds}。
@@ -72,6 +78,7 @@ class RagPipelineSelectionControllerTest {
         RagService service = new RagService(access, user, conversations, tracer, pipeline);
         return MockMvcBuilders.standaloneSetup(new KnowledgeChatController(service),
                 new RagController(service), new KnowledgeSearchController(pipeline, access, user, tracer),
+                new RagSessionController(sessions, service, new ObjectMapper(), user),
                 new KnowledgeChatStreamController(user, access, pipeline, streamClient, new ObjectMapper(), Runnable::run, 285000))
                 .setControllerAdvice(new GlobalExceptionHandler()).build();
     }
@@ -85,6 +92,32 @@ class RagPipelineSelectionControllerTest {
         ArgumentCaptor<AiServiceClient.RagQueryRequest> request = ArgumentCaptor.forClass(AiServiceClient.RagQueryRequest.class);
         verify(client).ragQuery(request.capture());
         return request.getValue();
+    }
+
+    /** 同步全库追问把租约范围和已完成历史送到所选引擎。 */
+    @ParameterizedTest
+    @ValueSource(strings = {"fixed", "langchain"})
+    void allLibrarySessionUsesAuthorizedScopeAndSavedHistory(String engine) throws Exception {
+        UUID id = UUID.randomUUID();
+        var scope = List.of(7L, 9L);
+        var lease = new RagSessionService.TurnLease(id, 42L, UUID.randomUUID(), scope, false);
+        var previous = new ChatMessage();
+        previous.setRole("user");
+        previous.setContent("previous question");
+        when(sessions.begin(42L, id)).thenReturn(lease);
+        when(sessions.context(lease)).thenReturn(List.of(previous));
+
+        mvc("fixed").perform(post("/rag/sessions/{id}/ask", id).contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"question":"follow up","pipelineEngine":"%s"}
+                                """.formatted(engine)))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.pipelineEngine").value(engine));
+
+        var request = capturedRequest();
+        assertEquals(scope, request.getKnowledgeBaseIds());
+        assertEquals(engine, request.getPipelineEngine());
+        assertEquals("previous question", request.getHistory().get(0).getContent());
+        verify(sessions).end(lease);
     }
 
     /** 核对 HTTP 200，并确认{@code $.pipelineEngine} 为 {@code "langchain"}、{@code $.pipelineEngine} 为 {@code "langchain"}。 */
@@ -168,6 +201,39 @@ class RagPipelineSelectionControllerTest {
         assertEquals("hybrid-rerank", capture.getValue().getVersion());
         assertEquals("support", capture.getValue().getEvidenceMode());
         assertEquals(List.of(7L), capture.getValue().getKnowledgeBaseIds());
+    }
+
+    /** 核对单轮 SSE 按授权范围发送 LangChain 请求，并转发同一引擎的增量和终态。 */
+    @Test
+    void explicitLangchainStreamsWithinTheAuthorizedScope() throws Exception {
+        MockMvc mvc = mvc("fixed");
+        doAnswer(call -> {
+            var output = call.<RagStreamClient.FrameHandler>getArgument(1);
+            output.onFrame("delta", """
+                    {"text":"draft","provisional":true}
+                    """);
+            output.onFrame("done", """
+                    {"outcome":"success","answer":"complete","pipelineEngine":"langchain"}
+                    """);
+            return null;
+        }).when(streamClient).stream(any(), any());
+
+        var result = mvc.perform(post("/knowledge/ask/stream")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"question":"q","pipelineEngine":"langchain"}
+                                """))
+                .andExpect(request().asyncStarted()).andReturn();
+
+        var capture = ArgumentCaptor.forClass(AiServiceClient.RagQueryRequest.class);
+        verify(streamClient).stream(capture.capture(), any());
+        assertEquals("langchain", capture.getValue().getPipelineEngine());
+        assertEquals(List.of(7L), capture.getValue().getKnowledgeBaseIds());
+        String events = result.getResponse().getContentAsString();
+        assertTrue(events.indexOf("event:delta") >= 0, events);
+        assertTrue(events.indexOf("event:done") > events.indexOf("event:delta"), events);
+        assertTrue(events.contains("\"provisional\":true"), events);
+        assertTrue(events.contains("\"pipelineEngine\":\"langchain\""), events);
     }
 
     /** 核对 HTTP 400。 */

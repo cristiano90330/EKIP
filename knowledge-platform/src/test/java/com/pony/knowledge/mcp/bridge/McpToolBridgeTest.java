@@ -12,6 +12,7 @@ import com.pony.knowledge.agent.tool.ToolRegistry;
 import com.pony.knowledge.agent.tool.input.ToolInput;
 import com.pony.knowledge.agent.tool.output.ToolResult;
 import com.pony.knowledge.mcp.config.McpProperties;
+import com.pony.knowledge.modelmanagement.ModelExecutionContext;
 import com.pony.knowledge.service.KnowledgeBaseAccessService;
 import io.modelcontextprotocol.common.McpTransportContext;
 import io.modelcontextprotocol.server.McpServerFeatures;
@@ -27,6 +28,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -186,14 +188,23 @@ class McpToolBridgeTest {
     @Test
     void call_resolvesIdentityFromTransportContext_andPassesThroughToolExecutor() {
         when(accessService.resolveReadableIds(42L)).thenReturn(Set.of(1L, 2L));
-        when(toolExecutor.execute(any(), any())).thenReturn(
-                ToolResult.builder().toolName("knowledge_search").success(true)
-                        .data(Map.of("hits", 3)).build());
+        when(toolExecutor.execute(any(), any())).thenAnswer(invocation -> {
+            assertEquals(42L, ModelExecutionContext.currentOwnerId());
+            assertNull(ModelExecutionContext.current(), "不得沿用其他请求的模型快照");
+            return ToolResult.builder().toolName("knowledge_search").success(true)
+                    .data(Map.of("hits", 3)).build();
+        });
         McpToolBridge bridge = bridge(List.of("knowledge_search"),
                 new FakeTool("knowledge_search", schemaWithRequired()));
         McpServerFeatures.SyncToolSpecification spec = bridge.buildSpecifications().get(0);
 
-        McpSchema.CallToolResult result = call(spec, exchangeWithUser(42L), Map.of("query", "连接池"));
+        McpSchema.CallToolResult result;
+        try (ModelExecutionContext ignored = ModelExecutionContext.open(Map.of("budgetMs", 2000), 90L)) {
+            result = call(spec, exchangeWithUser(42L), Map.of("query", "连接池"));
+            assertEquals(90L, ModelExecutionContext.currentOwnerId());
+            assertEquals(Map.of("budgetMs", 2000), ModelExecutionContext.current());
+        }
+        assertNull(ModelExecutionContext.currentOwnerId());
 
         ArgumentCaptor<ToolCall> callCaptor = ArgumentCaptor.forClass(ToolCall.class);
         ArgumentCaptor<AgentExecutionContext> contextCaptor =

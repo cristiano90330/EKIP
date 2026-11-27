@@ -10,6 +10,7 @@ import com.pony.knowledge.exception.RagQueryFailureException;
 import com.pony.knowledge.service.ai.AiServiceClient;
 import com.pony.knowledge.service.rag.model.RagQueryOutcome;
 import com.pony.knowledge.service.rag.model.DocumentReadWindow;
+import com.pony.knowledge.service.rag.query.ChatMessage;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.web.client.RestClientResponseException;
@@ -171,12 +172,19 @@ class PythonRagPipelineTest {
         PythonRagPipeline pipeline = pipeline(client, "hybrid-rerank-rewrite", "extractive", 1500,
                 true, 0.7, true, mock(RagTraceRecorder.class));
 
-        RagQueryOutcome result = pipeline.retrieveDocumentPage(List.of(7L), 10L, "阅读目标",
+        ChatMessage prior = new ChatMessage();
+        prior.setRole("user");
+        prior.setContent("要查柏川项目");
+        RagQueryOutcome result = pipeline.retrieveDocumentPage(List.of(7L), 10L, "柏川项目的阅读目标",
+                List.of(prior), "阅读目标",
                 new DocumentReadWindow(2, 120, null, null, 1, 120));
 
         AiServiceClient.RagQueryRequest request = captureRequest(client);
         assertEquals(List.of(7L), request.getKnowledgeBaseIds());
         assertEquals(10L, request.getDocumentId());
+        assertEquals("柏川项目的阅读目标", request.getQuestion());
+        assertEquals("阅读目标", request.getRetrievalQuery());
+        assertEquals("要查柏川项目", request.getHistory().get(0).getContent());
         assertTrue(request.isAdmitEvidence());
         assertFalse(request.isGenerate());
         assertFalse(request.isSmallToBigEnabled());

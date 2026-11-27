@@ -40,11 +40,15 @@ final class MinioReclaimPlanner {
     static Set<String> findOrphans(List<String> staleBucketKeys,
                                    Set<String> referencedPaths,
                                    boolean referencedLoadOk) {
-        if (!referencedLoadOk || referencedPaths.isEmpty()) {
+        if (!referencedLoadOk) {
+            return Set.of();
+        }
+        Set<String> normalized = normalize(referencedPaths);
+        if (normalized.isEmpty()) {
             return Set.of();
         }
         Set<String> orphans = new LinkedHashSet<>(staleBucketKeys);
-        orphans.removeAll(normalize(referencedPaths));
+        orphans.removeAll(normalized);
         return orphans;
     }
 

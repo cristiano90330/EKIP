@@ -35,11 +35,18 @@ class TaskLeaseHeartbeatTest {
         attempt.setId(3L);
         attempt.setTotalAttemptCount(2);
 
-        try (var registration = new TaskLeaseHeartbeat(tasks, scheduler, new TaskReliabilityProperties()).maintain(attempt)) {
-            for (int i = 0; i < 4; i++) tick.getValue().run();
+        var onLost = mock(Runnable.class);
+        try (var registration = new TaskLeaseHeartbeat(tasks, scheduler, new TaskReliabilityProperties())
+                .maintain(attempt, onLost)) {
+            tick.getValue().run();
+            tick.getValue().run();
+            verifyNoInteractions(onLost);
+            tick.getValue().run();
+            tick.getValue().run();
         }
 
         verify(tasks, times(3)).renewLease(3L, 2, 120_000L);
+        verify(onLost).run();
         verify(future).cancel(false);
     }
 }

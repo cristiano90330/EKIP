@@ -196,4 +196,65 @@ class ModelRegistryIntegrationTest {
         assertEquals(404,assertThrows(ModelManagementException.class,() -> tx(() -> {models.validateAgentModel(other,id);return null;})).getStatus());
         assertEquals(1L,models.list(owner).get(0).get("revision"));
     }
+
+    /** 在真实数据库中验证共享模型只读，重排凭证仅出现在内部执行快照。 */
+    @Test void deploymentDefaultsAreReadOnlyAndKeepCredentialOutOfPublicView() {
+        String fixtureKey = "registry-deployment-test-key";
+        ModelRegistryService defaults = registryWithDefaults(fixtureKey);
+        String rerankId = defaults.deploymentDefaultModelId("rerank");
+        Map<?,?> publicDefaults = (Map<?,?>) defaults.deploymentDefaults().get("defaults");
+        Map<?,?> publicRerank = (Map<?,?>) publicDefaults.get("rerank");
+        assertEquals(true, publicRerank.get("deploymentDefault"));
+        assertEquals(true, publicRerank.get("credentialConfigured"));
+        assertFalse(publicRerank.containsKey("apiKey"));
+        assertFalse(publicDefaults.toString().contains(fixtureKey));
+        assertTrue(defaults.list(owner).isEmpty());
+        assertEquals(404, assertThrows(ModelManagementException.class,
+                () -> tx(() -> defaults.credentials(owner, rerankId, 1, "other-test-key"))).getStatus());
+        assertEquals(404, assertThrows(ModelManagementException.class,
+                () -> tx(() -> { defaults.delete(other, rerankId, 1); return null; })).getStatus());
+        assertEquals(fixtureKey, defaults.resolveForPurpose(owner, "rerank", rerankId).get("apiKey"));
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT count(*) FROM managed_model WHERE id=? AND owner_id IS NULL
+                  AND credential_ciphertext IS NULL AND NOT jsonb_exists(config, 'apiKey')
+                """, Integer.class, rerankId));
+        assertEquals(503, assertThrows(ModelManagementException.class,
+                () -> registryWithDefaults("").resolveForPurpose(owner, "rerank", rerankId)).getStatus());
+    }
+
+    /** 模拟旧协议造成的个人覆盖失效，核对清除覆盖前后的执行选择。 */
+    @Test void stalePersonalBindingDoesNotSilentlyUseDeploymentDefault() {
+        ModelRegistryService defaults = registryWithDefaults("");
+        String id = (String) create("chat").get("id");
+        tx(() -> defaults.bind(owner, Map.of("bindings", Map.of("generate", id, "agent", id))));
+        jdbc.update("""
+                UPDATE managed_model SET config=jsonb_set(config, '{protocol}', to_jsonb(?::text))
+                WHERE owner_id=? AND id=?
+                """, "retired_chat_protocol", owner, id);
+
+        assertEquals(id, defaults.effectiveModelId(owner, "generate"));
+        assertTrue(defaults.list(owner).isEmpty());
+        assertEquals(503, assertThrows(ModelManagementException.class,
+                () -> defaults.resolveForPurpose(owner, "generate", id)).getStatus());
+        Map<?,?> selected = (Map<?,?>) defaults.executionForUser(owner, 5000, Set.of("generate", "rewrite")).get("bindings");
+        assertFalse(selected.containsKey("generate"));
+        assertEquals(defaults.deploymentDefaultModelId("rewrite"), ((Map<?,?>) selected.get("rewrite")).get("id"));
+        assertEquals(503, assertThrows(ModelManagementException.class,
+                () -> defaults.agentExecution(owner, null)).getStatus());
+
+        tx(() -> defaults.bind(owner, Map.of("bindings", Map.of())));
+        Map<?,?> restored = (Map<?,?>) defaults.executionForUser(owner, 5000, Set.of("generate")).get("bindings");
+        assertEquals(defaults.deploymentDefaultModelId("generate"), ((Map<?,?>) restored.get("generate")).get("id"));
+        Map<?,?> agent = (Map<?,?>) defaults.agentExecution(owner, null).get("bindings");
+        assertEquals(defaults.deploymentDefaultModelId("agent"), ((Map<?,?>) agent.get("agent")).get("id"));
+    }
+
+    /** 为用例配置共享默认模型，用独立数据库记录隔离配置和凭证。 */
+    private ModelRegistryService registryWithDefaults(String apiKey) {
+        ModelRegistryService defaults = new ModelRegistryService(jdbc, new ObjectMapper(),
+                new ModelCredentialCipher(Base64.getEncoder().encodeToString(new byte[32])),
+                mock(ModelRuntimeClient.class), "http://127.0.0.1:19111/v1", "http://127.0.0.1:19112/v1", apiKey);
+        tx(() -> { defaults.initializeDeploymentDefaults(); return null; });
+        return defaults;
+    }
 }

@@ -51,7 +51,10 @@ python tests/e2e/run_core_business_test.py --java-home "$env:JAVA_HOME"
 $env:PYTHONUTF8 = '1'
 python tests/e2e/run_real_document_rag_flow.py --scenario success
 python tests/e2e/run_real_document_rag_flow.py --scenario parser-failure
+python tests/e2e/run_real_document_rag_flow.py --scenario office-formats
 ```
+
+`office-formats` 用生成的 DOCX、XLSX、PPTX 和损坏的 DOCX 检查入库、任务租约及迟到数据边界。Java、FastAPI、PostgreSQL、Redis 和 MinIO 实际运行，Embedding 通过本机 HTTP 替身返回可复核的向量。`python tests/e2e/run_model_management_test.py --suite all` 在隔离 PostgreSQL 上运行模型登记与索引生命周期检查，模型 HTTP 使用替身。
 
 运行器使用已有的 PG17/pgvector、Redis、MinIO 镜像，在随机 loopback 端口启动一次性 tmpfs 容器和独立 Java/AI 进程，结束后清理。成功场景使用本地已存在的 `ekip-qwen3-embedding:0.6b-4k`，检查 PDF 解析、活动向量与 baseline 检索返回目标切片。`parser-failure` 场景上传程序内生成的损坏 PDF，检查失败状态、零切片/向量、原文件与回执保留，再经正常删除接口核对数据库级联和真实对象删除。
 

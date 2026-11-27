@@ -272,7 +272,7 @@ def test_full_recall_window_and_whole_question_are_reviewed_and_quotes_preserved
     assert result.required_source_ids == [8]
     assert result.total_tokens == 14
     assert len(calls) == 2 and {call[2] for call in calls} == {deadline}
-    assert result.policy_version == "answer-support-citation-gate-v30-question-and-evidence"
+    assert result.policy_version == "answer-support-citation-gate-v32-scoped-review"
     assert support.preserves_support(result, candidates)
     assert not support.preserves_support(result, candidates[:3])
     fragments = support.support_fragments(result, candidates)
@@ -366,6 +366,30 @@ def test_coverage_can_be_confirmed_from_an_exact_single_slot_only_for_refusal(sl
     assert result.required_spans == []
 
 
+@pytest.mark.parametrize(("keep_scope", "supported_by_source", "reason"), [
+    (True, False, "support_incomplete"),
+    (False, False, "support_question_coverage_incomplete"),
+    (True, True, "support_question_coverage_incomplete"),
+])
+def test_f8k_missing_repair_amount_has_coverage_when_single_slot_names_the_same_fact(
+        keep_scope, supported_by_source, reason):
+    """原问、独立问和名词式单要点指向同一费用上限，审阅拒绝时保留准确的缺证原因。"""
+    topic = "槐汀剧场交接规范给备用对讲机规定的维修费用上限"
+    question = f"{topic}是多少？"
+    source = ("槐汀剧场的备用对讲机存放在东侧值班台第二层抽屉。"
+              "设备需要维修时，值班人员在交接表登记故障时间和设备编号。")
+    slot = topic if keep_scope else "备用对讲机的维修费用上限"
+    verdict = supported(quote=source) if supported_by_source else unsupported()
+    result = support.review(question, [], [candidate(1, source)], monotonic() + 5, caller=two_stage(
+        decomp=decomposition(slot, standalone_question=question),
+        adjudication=support_reply(verdict, covered=False),
+    ))
+
+    assert (result.state, result.reason_code) == ("rejected", reason)
+    assert result.required_source_ids == []
+    assert result.required_spans == []
+
+
 def test_related_quote_without_requested_maximum_days_cannot_be_admitted():
     """验证 `(result.state, result.reason_code)` 等于 `('rejected', 'support_requested_quantity_missing')`，且 `not support.preserves_support(result, [candidate(1, source)])` 成立。"""
     source = "审批单须注明申请原因、权限范围与使用时限。"
@@ -407,6 +431,59 @@ def test_all_explicit_requested_measurements_remain_admissible():
     assert (result.state, result.reason_code) == ("accepted", "all_elements_supported")
 
 
+@pytest.mark.parametrize(("prefix", "topic", "suffix", "slot", "quote"), [
+    ("按现行层级规则，", "栖岭项目每人每天的市内交通费上限是多少元？", "请保留数字和单位。",
+     "栖岭项目每人每天的市内交通费限额是多少元？", "栖岭项目每人每天的市内交通费限额为230元。"),
+    ("请逐字引用", "棠篆水文站对备用量尺位置的规定。", "", "棠篆水文站的备用量尺位置",
+     "棠篆水文站的备用量尺放在北廊第二个带锁量具柜内。"),
+])
+def test_review_preserves_explicit_work_instructions_outside_the_decomposition(prefix, topic, suffix, slot, quote):
+    """执行前缀不参与机械覆盖校验，原始要求和逐字证据继续进入审查。"""
+    question = prefix + topic + suffix
+    calls = []
+    responses = iter([decomposition(slot, standalone_question=topic), support_reply(supported(quote=quote))])
+
+    def caller(system, user, deadline):
+        calls.append(user)
+        return next(responses)
+
+    result = support.review(question, [], [candidate(1, quote)], monotonic() + 5, caller=caller)
+
+    assert result.state == "accepted"
+    decomp_payload, _ = json.JSONDecoder().raw_decode(calls[0].split("\n", 1)[1])
+    assert decomp_payload["question"] == topic
+    evidence_payload = json.loads(calls[1].split("\n", 1)[1])
+    assert evidence_payload["original_request"] == question
+    expected_instructions = [prefix.rstrip("，")]
+    if suffix:
+        expected_instructions.append(suffix.rstrip("。"))
+    assert evidence_payload["execution_requirements"] == expected_instructions
+    assert result.required_spans == [{"source_id": 1, "content": quote}]
+
+
+def test_decomposition_retries_once_when_the_single_slot_loses_a_date():
+    """日期遗漏需修复并重新校验，模型无法补齐时不进入证据审查。"""
+    question = "在2027年1月，砚山项目报销附件的补齐期限是多少个工作日？"
+    dropped = decomposition("砚山项目报销附件的补齐期限是多少个工作日？", standalone_question=question)
+    quote = "砚山项目自2026年12月12日起执行新规则，报销附件须在10个工作日内补齐。"
+    for repaired in (decomposition(question), dropped):
+        requests = []
+        responses = iter([dropped, repaired, support_reply(supported(quote=quote))])
+
+        def caller(system, user, deadline):
+            requests.append(user)
+            return next(responses)
+
+        result = support.review(question, [], [candidate(1, quote)], monotonic() + 5, caller=caller)
+        assert support._DECOMPOSITION_COVERAGE_RETRY in requests[1]
+        if repaired is dropped:
+            assert (result.state, result.reason_code) == ("unavailable", "decomposition_question_coverage_incomplete")
+            assert len(requests) == 2
+        else:
+            assert result.state == "accepted"
+            assert len(requests) == 3
+
+
 def test_decomposition_must_keep_each_dimension_of_a_listed_question():
     """验证 `len(calls)` 等于 `1`。"""
     question = "高安全口令至少多少位、包含几类字符、特殊符号至少要有几个？"
@@ -430,6 +507,7 @@ def test_decomposition_must_keep_each_dimension_of_a_listed_question():
 @pytest.mark.parametrize(("question", "element"), [
     ("员工最多可申请10天远程办公吗？", "员工可申请10天远程办公"),
     ("禁止在生产环境中直接修改数据吗？", "在生产环境中直接修改数据"),
+    ("栖岭项目每人每天的市内交通费上限是多少元？", "栖岭项目每人每天的市内交通费最低限额是多少元？"),
 ])
 def test_decomposition_must_preserve_question_range_and_negation(question, element):
     """通过 `decomposition` 核对本用例构造的状态。"""
@@ -628,6 +706,30 @@ def test_conflicting_same_scope_measurements_cannot_be_resolved_by_model_choice(
     assert len(calls) == 1
     assert result.required_source_ids == []
     assert result.required_spans == []
+
+
+@pytest.mark.parametrize(("second_rule", "expected"), [
+    ("当本工坊备用气瓶通过出库复核时，交接登记限43小时内完成。", "support_conflict_unresolved"),
+    ("当本工坊备用气瓶通过出库复核前，交接登记限43小时内完成。", "all_elements_supported"),
+    ("当另一个工坊备用气瓶通过出库复核时，交接登记限43小时内完成。", "all_elements_supported"),
+])
+def test_paraphrased_deadlines_are_compared_only_for_the_applicable_condition(second_rule, expected):
+    """比较完整期限原句，保留触发时点和正文中的组织范围。"""
+    question = "玄砾工坊的备用气瓶完成出库复核后，应当在多少小时内完成交接登记？"
+    first_rule = "玄砾工坊的备用气瓶在完成出库复核后，须在29小时内完成交接登记。"
+    other_scope = "另一个工坊" if second_rule.startswith("当另一个工坊") else "玄砾工坊"
+    sources = [
+        candidate(1, "玄砾工坊现行出库复核登记规程，甲。另附班次与回执登记说明。" + first_rule
+                  + "复核回执与交接记录应分别归档。"),
+        candidate(2, f"本规程只适用于{other_scope}。签发部门和效力与甲规程相同。"
+                  + second_rule + "交班人应同步核对存根。"),
+    ]
+    result = support.review(question, [], sources, monotonic() + 5, caller=two_stage(
+        decomp=decomposition(question), adjudication=support_reply(supported(1, first_rule)),
+    ))
+
+    assert result.reason_code == expected
+    assert result.required_source_ids == ([] if expected == "support_conflict_unresolved" else [1])
 
 
 def test_fine_rule_precedes_institution_when_scoped_measurements_conflict():

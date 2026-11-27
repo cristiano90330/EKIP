@@ -38,6 +38,44 @@ class TestGenerateStream(unittest.TestCase):
         self.assertEqual(payload.outcome, "success")
         self.assertEqual(len(out), 2)
 
+    def test_provisional_text_handles_fragmented_json_escapes(self):
+        """逐片解码引号、换行和跨片代理对，完整终态沿用同一正文。"""
+        chunks = [
+            '{"sta',
+            'tus":"suc',
+            r'cess","answer":"First\n\"Second\uD83D',
+            r'\uDCA1\"; \\',
+            r' end"}',
+        ]
+        terminal = ChatResult(content="".join(chunks), prompt_tokens=3, completion_tokens=2)
+        with self._with_gate_stream([*chunks, terminal]):
+            out = list(RAGService().generate_stream("q", [ContextItem(content="c")], provisional=True))
+
+        self.assertEqual(out[:-1], [
+            ("delta", 'First\n"Second'),
+            ("delta", '\U0001f4a1"; \\'),
+            ("delta", " end"),
+        ])
+        self.assertEqual(out[-1][1].answer, 'First\n"Second\U0001f4a1"; \\ end')
+
+    def test_provisional_answer_before_status_waits_for_complete_success(self):
+        """先出现的答复等到顶层状态闭合才可展示。"""
+        chunks = ['{"answer":"answer","status":"success', '"', '}']
+        terminal = ChatResult(content="".join(chunks), prompt_tokens=3, completion_tokens=2)
+        advanced = []
+
+        def stream(*args, **kwargs):
+            for index, chunk in enumerate(chunks):
+                advanced.append(index)
+                yield chunk
+            yield terminal
+
+        with mock.patch("ai.app.rag.rag_service.gate.stream", stream):
+            iterator = RAGService().generate_stream("q", [ContextItem(content="c")], provisional=True)
+            self.assertEqual(next(iterator), ("delta", "answer"))
+            self.assertEqual(advanced, [0, 1])
+            self.assertEqual(list(iterator)[0][1].answer, "answer")
+
     def test_degraded_yields_empty_answer_and_reason(self):
         """通过 `self.assertEqual` 核对本用例构造的状态。"""
         svc = RAGService()

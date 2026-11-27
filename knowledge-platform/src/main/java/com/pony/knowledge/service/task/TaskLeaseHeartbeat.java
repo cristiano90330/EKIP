@@ -43,9 +43,10 @@ public class TaskLeaseHeartbeat {
      * 下游为 DocumentTaskMapper.renewLease。
      *
      * @param attempt 处理尝试对应的任务快照
+     * @param onLost 数据库确认本次续租无效时执行的取消回调
      * @return 在本次处理完成后可关闭的续租登记
      */
-    public Registration maintain(DocumentTask attempt) {
+    public Registration maintain(DocumentTask attempt, Runnable onLost) {
         Duration interval = Duration.ofMillis(properties.getLeaseRenewIntervalMs());
         AtomicBoolean lost = new AtomicBoolean();
         var future = scheduler.scheduleWithFixedDelay(() -> {
@@ -53,6 +54,7 @@ public class TaskLeaseHeartbeat {
             try {
                 if (tasks.renewLease(attempt.getId(), attempt.getTotalAttemptCount(), properties.getLeaseDurationMs()) == 0) {
                     lost.set(true);
+                    onLost.run();
                 }
             } catch (RuntimeException e) {
                 // A later heartbeat can retry while the database lease is still valid.

@@ -127,7 +127,7 @@ public class ReadDocumentTool implements AgentTool {
         // 先定位可信范围中的目标文档，再让读取模式决定检索计划和分页限制。
         String mode = readInput.getMode() == null ? "query" : readInput.getMode();
         if ("page".equals(mode)) {
-            return readPage(readInput, scope, document);
+            return readPage(readInput, scope, document, context);
         }
         if (!"query".equals(mode) || readInput.getOffset() != null
                 || readInput.getContentOffset() != null || readInput.getEndOffset() != null
@@ -177,9 +177,11 @@ public class ReadDocumentTool implements AgentTool {
      * @param input 本次操作的结构化输入
      * @param scope 当前已授权的知识库 ID 集合
      * @param document 数据库中已定位的目标文档
+     * @param context 含本轮原问和会话历史的可信执行上下文
      * @return 带载荷或可识别错误状态的工具结果
      */
-    private ToolResult readPage(ReadDocumentInput input, Set<Long> scope, Document document) {
+    private ToolResult readPage(ReadDocumentInput input, Set<Long> scope, Document document,
+                                AgentExecutionContext context) {
         int offset = input.getOffset() == null ? 0 : input.getOffset();
         int contentOffset = input.getContentOffset() == null ? 0 : input.getContentOffset();
         int radius = input.getContextRadius() == null ? 1 : input.getContextRadius();
@@ -199,8 +201,13 @@ public class ReadDocumentTool implements AgentTool {
 
         DocumentReadWindow window = new DocumentReadWindow(offset, contentOffset,
                 input.getEndOffset(), input.getAroundChunkId(), radius, windowChars);
+        // 工具短查询用于重排，准入仍需从原问核对项目和适用范围。
+        String question = context.getCurrentQuery();
+        boolean hasTurnQuestion = question != null && !question.isBlank();
         RagQueryOutcome outcome = documentScopedEvidenceReader.readPage(
-                new ArrayList<>(scope), document.getId(), input.getQuery(), window);
+                new ArrayList<>(scope), document.getId(), hasTurnQuestion ? question : input.getQuery(),
+                hasTurnQuestion ? context.getQuestionHistory() : List.of(),
+                hasTurnQuestion ? input.getQuery() : null, window);
         if (outcome == null) {
             throw contractMismatch(null);
         }

@@ -3,9 +3,10 @@
 import contextvars
 import logging
 import re
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import replace
+from functools import partial
 from math import isfinite
 from time import monotonic
 
@@ -64,10 +65,10 @@ from ai.app.rag.state import QueryState
 from ai.app.rag.evidence_support import (
     POLICY_VERSION as SUPPORT_POLICY_VERSION, review, preserves_support, support_fragments,
 )
-from ai.app.rag.prompt_builder import build_prompt, SYSTEM_PROMPT
+from ai.app.rag.prompt_builder import build_prompt
 from ai.app.llm.tokens import count_tokens, input_tokens
 from ai.app.llm.context_input import organizing, unique_paragraphs
-from ai.app.rag.rag_service import generation_response_format
+from ai.app.rag.rag_service import generation_contract
 from ai.app.llm.purposes import get_purpose
 from ai.app.models.context import model_execution, evidence_threshold
 from ai.app.models.resolution import ModelConfigurationError
@@ -582,15 +583,13 @@ def _stage_dto(rec) -> dict:
 # 校验流式问答请求并返回事件迭代器，允许调用方提供替代检索与生成函数。
 # 上游为 `ai.app.rag.router._progress_stream.produce`，下游调用 `_validate_request`、`_stream_in_context`。
 def run_query_stream(request: RagQueryRequest, *, retrieve=None, generate_stream=None):
-    """`run_query` 的流式孪生（**普通函数**：先校验、再返回生成器——生成器的函数体要到第一次
-    迭代才执行，非法输入必须能被路由映射成 400，而不是流到一半才 500）。
+    """先校验 Java 的问答请求，再为所选引擎返回 SSE 事件迭代器。
 
-    只支持 `pipelineEngine="fixed"`；langchain 的流式在 Plan B 接线。**非 fixed 一律响亮拒绝**，
-    绝不静默按 fixed 跑（那会让响应回显 pipelineEngine="langchain" 却给出 fixed 的结果）。
+    上游为 `ai.app.rag.router.rag_query_stream`。开发联调的证据绕过模式仅接收 fixed。
     """
-    if request.pipelineEngine != "fixed":
-        raise ValueError("streaming supports pipelineEngine=fixed only")
     budget_ms = _validate_request(request)
+    if _development_test_active(request) and request.pipelineEngine != "fixed":
+        raise ValueError("development test mode supports pipelineEngine=fixed only")
     return _stream_in_context(
         _stream_events(request, budget_ms, retrieve=retrieve, generate_stream=generate_stream))
 
@@ -618,11 +617,9 @@ def _stream_in_context(gen):
 # 改写、检索、准入与同步路径共用状态步骤，生成失败在流中以错误事件交付。
 # 下游调用 `ai.app.observability.stage_trace.collecting`、`ai.app.rag.deadline.query_deadline`。
 def _stream_events(request: RagQueryRequest, budget_ms: int, *, retrieve=None, generate_stream=None):
-    """生成器本体：复用同一套步骤（prepare→rewrite→retrieve→admit→postprocess），只在 generate
-    一步把结果逐块产出，并把阶段记录增量编码成事件。
+    """在所选引擎的召回与证据准入后发送正文增量、来源和唯一终态。
 
-    产出 `{"event", "data"}`；事件名 ∈ stage/sources/delta/done/error，以 done 或 error 恰好终止。
-    `retrieve` / `generate_stream` 是测试侧注入点，语义与 `retrieve_query` 的 `retrieve=` 一致。
+    `retrieve` 是固定流程的测试注入点，`generate_stream` 可替代两个引擎的生成。
     """
     failed_token = _FAILED_STAGE.set(None)
     last_token = _LAST_STAGE.set(None)
@@ -633,21 +630,30 @@ def _stream_events(request: RagQueryRequest, budget_ms: int, *, retrieve=None, g
                 if _development_test_active(request):
                     yield from _run_development_test_stream(request, collector)
                     return
-                if request.evidenceMode is not None:
+                is_langchain = request.pipelineEngine == "langchain"
+                if is_langchain or request.evidenceMode is not None:
                     yield {"event": "execution", "data": {
                         "pipelineEngine": request.pipelineEngine,
                         "retrievalVersion": request.version,
                         "evidenceMode": _evidence_mode(request)}}
-                state = prepare_query(request)
-                emitted = 0
-                for step in (rewrite_query, retrieve_query, admit_query, postprocess_query):
-                    if state.response is not None:
-                        break
-                    state = step(state) if step is not retrieve_query else retrieve_query(
-                        state, retrieve=retrieve)
-                    for rec in collector.records[emitted:]:
+                if is_langchain:
+                    from ai.app.rag.langchain_pipeline import prepare_generation
+
+                    state = prepare_generation(request)
+                    for rec in collector.records:
                         yield {"event": "stage", "data": _stage_dto(rec)}
                     emitted = len(collector.records)
+                else:
+                    state = prepare_query(request)
+                    emitted = 0
+                    for step in (rewrite_query, retrieve_query, admit_query, postprocess_query):
+                        if state.response is not None:
+                            break
+                        state = step(state) if step is not retrieve_query else retrieve_query(
+                            state, retrieve=retrieve)
+                        for rec in collector.records[emitted:]:
+                            yield {"event": "stage", "data": _stage_dto(rec)}
+                        emitted = len(collector.records)
                 if state.response is not None:
                     for rec in collector.records[emitted:]:
                         yield {"event": "stage", "data": _stage_dto(rec)}
@@ -663,18 +669,24 @@ def _stream_events(request: RagQueryRequest, budget_ms: int, *, retrieve=None, g
                     yield {"event": "done", "data": _finalize(state, request, collector).model_dump()}
                     return
                 gen = generate_stream or rag_service.generate_stream
+                if is_langchain and generate_stream is None:
+                    gen = partial(gen, provisional=True)
                 contexts = [_to_context(candidate) for candidate in state.admitted]
                 terminal = None
                 try:
                     with _at_stage("generate"), stage("generate") as pending:
                         _ensure_deadline()
                         generation_question = _generation_question(state)
-                        for kind, payload in gen(generation_question, contexts, state.history):
-                            if kind == "delta":
-                                _ensure_deadline()
-                                yield {"event": "delta", "data": {"text": payload}}
-                            else:
-                                terminal = payload
+                        with closing(gen(generation_question, contexts, state.history)) as model_events:
+                            for kind, payload in model_events:
+                                if kind == "delta":
+                                    _ensure_deadline()
+                                    data = {"text": payload}
+                                    if is_langchain:
+                                        data["provisional"] = True
+                                    yield {"event": "delta", "data": data}
+                                else:
+                                    terminal = payload
                         _ensure_deadline()
                         pending.total_tokens = terminal.token_cost or None
                         pending.degraded = terminal.outcome == "dependency_unavailable"
@@ -1234,7 +1246,7 @@ def _admit_support(state: QueryState) -> QueryState:
         failed_stage="evidence_gate" if unavailable else None))
 
 
-def postprocess_query(state: QueryState) -> QueryState:
+def postprocess_query(state: QueryState, *, provisional: bool = False) -> QueryState:
     """对获准证据执行允许的组合处理，并确认处理后的正文仍保留已通过校验的支撑。
 
     上游为 `ai.app.rag.langchain_pipeline._postprocess_state`，下游调用 `_at_stage`、`_ensure_deadline`。
@@ -1291,7 +1303,7 @@ def postprocess_query(state: QueryState) -> QueryState:
     state = replace(state, admitted=admitted, compression=compression,
                     evidence_sources=[_to_source(candidate) for candidate in admitted])
     if request.generate and admitted:
-        state = _fit_generation_input(state)
+        state = _fit_generation_input(state, provisional=provisional)
         if state.response is not None:
             return state
     if not admitted:
@@ -1304,12 +1316,13 @@ def postprocess_query(state: QueryState) -> QueryState:
     return state
 
 
-def _fit_generation_input(state: QueryState) -> QueryState:
+def _fit_generation_input(state: QueryState, *, provisional: bool = False) -> QueryState:
     """根据生成模型窗口估算提示开销，先缩减可移除历史，再确定保留证据能否进入当前预算。
 
     上游为 `postprocess_query`，下游调用 `ai.app.llm.purposes.get_purpose`、`cost`。
     """
     budget = get_purpose("generate").budget_tokens
+    system, response_format, _ = generation_contract(provisional=provisional)
 
     def cost(value):
         """运行生成提示的相同组织方式，返回指定查询状态的估计输入 Token 成本。
@@ -1317,10 +1330,10 @@ def _fit_generation_input(state: QueryState) -> QueryState:
         上游为 `_fit_generation_input`，下游调用 `ai.app.llm.tokens.input_tokens`、`ai.app.rag.prompt_builder.build_prompt`。
         """
         return input_tokens([
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": build_prompt(_generation_question(value),
                 [_to_context(candidate) for candidate in value.admitted], value.history)}],
-            response_format=generation_response_format())
+            response_format=response_format)
 
     before = cost(state)
     if before <= budget:

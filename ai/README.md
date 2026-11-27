@@ -160,7 +160,7 @@ Compose 会带起 AI 的基础依赖；`minio-init` 负责创建 bucket，完整
 | PostgreSQL host | `localhost` | `postgres`，可用 `PG_READONLY_HOST` 覆盖 |
 | MinIO | `localhost:9000`、`minioadmin / minioadmin`、bucket `knowledge` | `minio:9000`、`admin / 12345678`、bucket `knowledge-files` |
 
-模型地址和选择不再由 Compose 环境变量决定，在模型管理登记。`MODEL_RESOURCE_GROUPS` 留空时使用 `{"local-gpu":1}`，`MODEL_RESOURCE_QUEUE_LIMIT` 默认为 8；首版使用单 Python worker/实例。容器访问宿主机 Ollama 时，使用 OpenAI 兼容协议和部署环境可达的 `http://host.docker.internal:11434/v1`。
+模型地址和选择在模型管理登记。`MODEL_RESOURCE_GROUPS` 留空时使用 `{"local-gpu":1}`，`MODEL_RESOURCE_QUEUE_LIMIT` 默认为 8。多个 AI 进程共用设备时，可配置 [Redis 共享资源组](../docs/model-management.md#5-预算显存与就绪)。容器访问宿主机 Ollama 时，使用 OpenAI 兼容协议和部署环境可达的 `http://host.docker.internal:11434/v1`。
 
 根 `.env` 用于 Compose 插值，只有服务 `environment` 中声明的基础设施变量进入容器。旧模型选型和全局评分阈值变量不再影响生产调用。
 
@@ -177,7 +177,7 @@ Compose 会带起 AI 的基础依赖；`minio-init` 负责创建 bucket，完整
 | POST | `/parser/pdf/object` | 固定按 PDF 解析同一对象请求 |
 | POST | `/embedding` | 批量文本向量化，供入库与查询使用 |
 | POST | `/rag/query` | 同步 RAG / 只检索 |
-| POST | `/rag/query/stream` | RAG SSE，仅 `fixed` |
+| POST | `/rag/query/stream` | 固定流程和 LangChain RAG SSE |
 | POST | `/evaluation/generate` | 生成质量裁判 |
 | POST | `/agent/decide` | 单次工具调用决策 |
 | POST | `/agent/decide/stream` | 决策 SSE：`delta` 正文增量 + `final` 终态（含 tool_calls / finish_reason） |
@@ -458,19 +458,20 @@ RAG 的 HTTP 200 表示返回了查询结果，仍需检查 `outcome`。无证�
 
 ### 5.5 流式请求
 
-`POST /rag/query/stream` 接收相同请求模型，但只允许 `pipelineEngine=fixed`；指定 `langchain` 返回 400。响应为 `text/event-stream`。
+`POST /rag/query/stream` 接收与同步接口相同的请求模型，支持 `fixed` 和 `langchain`，响应为 `text/event-stream`。LangChain 同步与流式共用 LCEL 的生成前流程，再按选定的模型执行生成。
 
-模型原始 JSON 分片在生成模块内缓冲，完整验证成功后才发送正文 delta，正文因此在生成结束后到达。阶段进度继续实时发送。生成请求的 `sources` 帧在生成结束后返回，终帧的 `evidenceSources` 是最终可展示证据；拒答不发正文 delta、公开证据为空，以 `done=no_evidence` 结束。结构错误或传输故障以 `error` 结束。
+固定流程在完整校验模型 JSON 后发送正文。LangChain 在解析到明确的 `status=success` 后，以增量发送已解码的答复正文。增量属于生成中内容，完整模型结果仍须通过结构校验。客户端用 `done` 的 `answer` 和 `evidenceSources` 确认最终正文和引用。
 
 | 事件 | `data` |
 | --- | --- |
 | `stage` | 阶段记录 |
 | `sources` | `sources`、`evidenceSources`、`evidenceDecision` |
-| `delta` | `{"text":"..."}`，答案增量 |
+| `execution` | 实际引擎、检索版本和证据模式，供 Java 在转发正文前核对 |
+| `delta` | `{"text":"..."}`，LangChain 的生成中正文另带 `provisional:true` |
 | `done` | 完整 `RagQueryResponse` |
 | `error` | `outcome / reasonCode / failedStage / requestId / message` |
 
-正常生成时，先发送已完成阶段与来源，再发送文本增量，最后发送生成阶段和 `done`。空证据或只检索可直接以 `done` 结束；依赖故障 / 超时以 `error` 结束，不发送 `done`。若已经收到部分 `delta` 后出现 `error`，应将其显示为未完成回答。
+已完成阶段通过 `stage` 回报，长上下文整理通过 `context` 报告进度。只检索可直接以 `done` 结束。正常拒答以 `done` 和 `outcome=no_evidence` 结束，公开证据为空。结构错误、依赖故障或超时以 `error` 结束，客户端需清除 LangChain 的临时正文。
 
 建立流之前的参数、鉴权或容量错误仍使用普通 HTTP 错误。流建立后的失败通过事件报告，不能只看 HTTP 200。
 
@@ -668,7 +669,9 @@ Java 的 ReAct 循环据此区分「自然停止」「输出上限截断」「�
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `MODEL_RESOURCE_GROUPS` | 留空采用 `{"local-gpu":1}` | 部署资源组容量，与每模型并发分开 |
-| `MODEL_RESOURCE_QUEUE_LIMIT` | `8` | 有界资源等待队列 |
+| `MODEL_RESOURCE_QUEUE_LIMIT` | `8` | 单进程内等待本地或共享槽位的队列上限 |
+| `MODEL_RESOURCE_REDIS_URL` | 空 | 共享资源组协调地址。留空使用进程内配额 |
+| `MODEL_RESOURCE_REDIS_NAMESPACE` | `ekip` | 共用资源组的进程使用同一 Redis 命名空间 |
 
 模型记录由 Java 管理。独立加密主密钥 `MODEL_CONFIG_ENCRYPTION_KEY` 只注入 Java，不转发 Python。旧模型 dotenv 变量不再参与生产选型，修改旧超时/维度/模型名也不会改变本次快照。
 

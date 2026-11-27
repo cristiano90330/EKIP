@@ -9,6 +9,8 @@ import com.pony.knowledge.service.ai.AiServiceClient;
 import com.sun.net.httpserver.HttpServer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -26,14 +28,22 @@ class RagStreamClientCircuitTest {
     /** 通过 {@code exercise} 驱动该场景，核对输出和依赖调用。 */
     @Test void successfulStreamRecordsAvailabilityAndDeliversTerminalFrame() throws Exception { exercise(200); }
 
-    /** 以显式策略发起 SSE 请求，确认先核对实际策略，再接收正文增量。 */
-    @Test void explicitPresetRequiresMatchingAcknowledgementBeforeDeltas() throws Exception {
-        String metadata = "{\"pipelineEngine\":\"fixed\",\"retrievalVersion\":\"hybrid\",\"evidenceMode\":\"support\"}";
-        String payload = "event: delta\ndata: {\"text\":\"answer\"}\n\nevent: done\ndata: " + metadata + "\n\n";
+    /** 核对显式策略和默认 LangChain 策略的执行确认，并拒绝引擎不符的终态。 */
+    @ParameterizedTest
+    @CsvSource({"fixed,support", "langchain,"})
+    void validatesAcknowledgementAndTerminalEngine(String engine, String requestedEvidenceMode) throws Exception {
+        String metadata = """
+                {"pipelineEngine":"%s","retrievalVersion":"hybrid","evidenceMode":"support"}
+                """.formatted(engine).strip();
+        String mismatched = metadata.replace(engine, "wrong");
         AtomicInteger hits = new AtomicInteger();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/rag/query/stream", exchange -> {
-            String prefix = hits.getAndIncrement() == 0 ? "" : "event: execution\ndata: " + metadata + "\n\n";
+            int attempt = hits.getAndIncrement();
+            String prefix = attempt == 0 ? "" : "event: execution\ndata: " + metadata + "\n\n";
+            String terminal = attempt == 1 ? mismatched : metadata;
+            String payload = "event: delta\ndata: {\"text\":\"answer\"}\n\nevent: done\ndata: "
+                    + terminal + "\n\n";
             byte[] body = (prefix + payload).getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
@@ -45,12 +55,20 @@ class RagStreamClientCircuitTest {
             var client = new RagStreamClient("http://127.0.0.1:" + server.getAddress().getPort(), 1000, 1000,
                     "test-internal-token", new ObjectMapper(), guard);
             var request = new AiServiceClient.RagQueryRequest();
+            request.setPipelineEngine(engine);
             request.setVersion("hybrid");
-            request.setEvidenceMode("support");
+            request.setEvidenceMode(requestedEvidenceMode);
             var error = assertThrows(RagStreamClient.RagStreamException.class,
                     () -> client.stream(request, (event, data) -> fail("unconfirmed strategy must not forward content")));
             assertEquals("ai_contract_mismatch", error.getReasonCode());
+
             var forwarded = new ArrayList<String>();
+            var terminalError = assertThrows(RagStreamClient.RagStreamException.class,
+                    () -> client.stream(request, (event, data) -> forwarded.add(event)));
+            assertEquals("ai_contract_mismatch", terminalError.getReasonCode());
+            assertEquals(List.of("delta"), forwarded);
+
+            forwarded.clear();
             client.stream(request, (event, data) -> forwarded.add(event));
             assertEquals(List.of("delta", "done"), forwarded);
         } finally {

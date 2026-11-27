@@ -3,8 +3,10 @@
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextlib import suppress
 from contextvars import ContextVar, copy_context
 from queue import Empty, Full, Queue
+from socket import SHUT_RDWR
 from threading import BoundedSemaphore, Event, Lock, Thread
 from time import monotonic
 from uuid import uuid4
@@ -56,17 +58,29 @@ class IOState:
                      if value is not None]
         return min(deadlines) - monotonic() if deadlines else None
 
-    def attach(self, value):
+    def attach(self, value, *, stream_response=None):
         """登记实际 HTTP 资源供超时或断连时关闭，避免取消已经发生后继续持有连接。
 
-        下游调用 `ai.app.rag.deadline.QueryDeadlineExceeded`。
+        流式调用可传入底层响应，供取消时中断正在阻塞的套接字读取。
         """
         with self.lock:
-            self.closers.append(value)
-        if self.cancelled.is_set():
+            if not self.cancelled.is_set():
+                self.closers.append((value, stream_response))
+                return value
+        self._close_resource(value, stream_response)
+        raise QueryDeadlineExceeded("model execution was cancelled")
+
+    def _close_resource(self, value, stream_response):
+        """取消进行中的 HTTP 流时唤醒阻塞读，随后通过 SDK 关闭响应。"""
+        if self.cancelled.is_set() and stream_response is not None and not stream_response.is_closed:
+            # Linux 上从另一线程 close 连接时，正在 recv 的线程仍可能持有套接字。
+            with suppress(OSError):
+                network = stream_response.extensions.get("network_stream")
+                sock = network.get_extra_info("socket") if network is not None else None
+                if sock is not None:
+                    sock.shutdown(SHUT_RDWR)
+        with suppress(Exception):
             value.close()
-            raise QueryDeadlineExceeded("model execution was cancelled")
-        return value
 
     def close(self):
         """从状态中取出 HTTP 资源并关闭，供传输调用及取消入口共同清理。
@@ -75,11 +89,8 @@ class IOState:
         """
         with self.lock:
             values, self.closers = self.closers, []
-        for value in reversed(values):
-            try:
-                value.close()
-            except Exception:
-                pass
+        for value, stream_response in reversed(values):
+            self._close_resource(value, stream_response)
 
     def cancel(self):
         """标记当前传输已取消并请求关闭连接，使运行中的工作线程能够退出。"""

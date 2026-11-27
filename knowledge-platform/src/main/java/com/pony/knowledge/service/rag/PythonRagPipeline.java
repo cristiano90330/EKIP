@@ -429,13 +429,16 @@ public class PythonRagPipeline {
      * @param knowledgeBaseIds 知识库 ID 列表
      * @param documentId 文档 ID
      * @param question 用户问题正文
+     * @param history 已授权的历史问答，用于证据审阅
+     * @param retrievalQuery 用于检索与重排的工具短查询
      * @param window 读取切片或保留历史的窗口约束
      * @return 服务内部问答结果、候选与证据、执行信息和降级状态，以 RagQueryOutcome 返回
      */
     public RagQueryOutcome retrieveDocumentPage(List<Long> knowledgeBaseIds, Long documentId,
-                                               String question,
+                                               String question, List<ChatMessage> history, String retrievalQuery,
                                                DocumentReadWindow window) {
-        return call(knowledgeBaseIds, question, List.of(), 1, false, true, documentId, null, window);
+        return call(knowledgeBaseIds, question, history, 1, false, true,
+                documentId, null, window, retrievalQuery);
     }
 
     /**

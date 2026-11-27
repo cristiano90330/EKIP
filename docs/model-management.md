@@ -107,7 +107,11 @@ indexScopes: 每个已授权 KB 的 generationId、spaceId、dimension、embeddi
 
 单模型 `runtime.timeoutMs` 从取得模型及资源组槽位后计算，限制本次推理。共享资源排队消耗请求总预算，总截止预算覆盖排队、网络读取、重试退避和流式正文。缺少请求总预算的内部直接调用沿用单模型超时作为整次调用上限。个人模型默认 `retries=0`、`backoffMs=500`、`maxConcurrency=1`，Embedding 默认模型超时 120000ms，其他个人模型默认 20000ms。部署共享模型按用途使用本页的时限。
 
-模型并发和共享资源组容量分别管理。部署变量 `MODEL_RESOURCE_GROUPS` 留空时采用 `{"local-gpu":1}`，`MODEL_RESOURCE_QUEUE_LIMIT` 默认 8。`source=local` 且未指定组时进入 `local-gpu`。首版应运行 **单 Python worker、单 AI 实例** 来维持该设备容量保证；多进程会各持一份资源状态。
+模型并发和共享资源组容量分别管理。`MODEL_RESOURCE_GROUPS` 留空时采用 `{"local-gpu":1}`，`MODEL_RESOURCE_QUEUE_LIMIT` 默认 8，按 AI 进程统计。`source=local` 且未指定组时进入 `local-gpu`。默认在单个 Python 进程内限制设备配额。
+
+多个 AI 进程共用一台设备时，给这些进程配置相同的 `MODEL_RESOURCE_REDIS_URL`、`MODEL_RESOURCE_REDIS_NAMESPACE` 和资源组容量。Redis 原子发放同组租约，调用退出时只释放自己的槽位。协调不可用时，申请共享组的调用返回 `model_resource_coordination_unavailable`。进程异常退出后，租约按该次模型的超时上限加 30 秒回收。每模型并发配置仍按进程生效。
+
+根 Compose 使用现有 Redis 时，可设置 `MODEL_RESOURCE_REDIS_URL=redis://redis:6379/2` 并启动 Redis 服务。多实例部署使用可保留活动租约的 Redis。协调存储丢失活动租约时，设备端的并发限制仍负责保护已经发出的推理。
 
 容量 1 能限制 EKIP 同时发起的本地模型调用，不能保证多个模型权重同时驻留 8GB 显存。Ollama 的量化、上下文、KV cache 和其他进程仍影响冷加载与显存。可将 Chat、Embedding、Rerank 分别迁至云端或较小本地模型，按实测决定；登记一个 4B 名称不证明它在本机可用。
 

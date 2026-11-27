@@ -1,4 +1,4 @@
-/* 定期扫描满足保护期的对象，并根据当前引用关系回收孤儿。 */
+/* 定期扫描超过宽限期的对象，并按配置预览或删除孤儿对象。 */
 
 package com.pony.knowledge.service.storage;
 
@@ -22,8 +22,8 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 定时回收数据库已无引用且超过宽限期的 MinIO 对象，补偿文档删除后对象清理失败留下的孤儿文件。
- * 功能默认关闭；数据库引用或 bucket 列表读取失败时整轮不删除，单个对象删除失败留待后续扫描。
+ * 对照数据库引用和 MinIO 对象列表，补偿文档删除后遗留的孤儿文件。
+ * 功能默认关闭。预览和删除使用相同的候选清单，单个对象删除失败留待后续扫描。
  */
 @Component
 public class MinioReclaimService {
@@ -34,45 +34,56 @@ public class MinioReclaimService {
 
     private final DocumentMapper documentMapper;
 
-    @Value("${minio.bucket-name}")
-    private String bucketName;
+    private final String bucketName;
 
-    @Value("${storage.reclaim.enabled:false}")
-    private boolean enabled;
+    private final ReclaimMode mode;
 
-    @Value("${storage.reclaim.grace-period-hours:24}")
-    private long gracePeriodHours;
+    private final long gracePeriodHours;
 
     /**
-     * 保存定期扫描满足保护期的对象所需的依赖和初始配置。
-     * 上游为 Spring 组件装配。
+     * 由 Spring 注入扫描依赖和配置，启动时解析回收模式。
      *
      * @param minioClient 访问对象存储服务的客户端
-     * @param documentMapper DocumentMapper，负责提供文档查询、切片分页、写入锁定和对象引用查询
+     * @param documentMapper 提供文档对象引用的数据库查询
+     * @param bucketName 文档对象所在的 MinIO 桶
+     * @param configuredMode 显式回收模式，空值沿用旧开关
+     * @param legacyEnabled 旧回收开关，启用时按原行为删除候选对象
+     * @param gracePeriodHours 对象进入候选范围前的宽限期（小时）
      */
-    public MinioReclaimService(MinioClient minioClient, DocumentMapper documentMapper) {
+    public MinioReclaimService(MinioClient minioClient, DocumentMapper documentMapper,
+                               @Value("${minio.bucket-name}") String bucketName,
+                               @Value("${storage.reclaim.mode:}") String configuredMode,
+                               @Value("${storage.reclaim.enabled:false}") boolean legacyEnabled,
+                               @Value("${storage.reclaim.grace-period-hours:24}") long gracePeriodHours) {
         this.minioClient = minioClient;
         this.documentMapper = documentMapper;
+        this.bucketName = bucketName;
+        this.mode = ReclaimMode.resolve(configuredMode, legacyEnabled);
+        this.gracePeriodHours = gracePeriodHours;
     }
 
     /**
-     * 在配置允许时回收超过保护期且未被数据库持有的对象。
-     * 上游为 应用的定时调度器。
-     * 下游为 DocumentMapper.selectAllFilePaths、MinioReclaimPlanner.findOrphans。
+     * 由定时调度器触发一次扫描，以日志输出预览或删除结果。
+     * 下游读取 DocumentMapper 和 MinIO，候选判定交给 MinioReclaimPlanner。
      */
     @Scheduled(fixedDelayString = "${storage.reclaim.scan-interval-ms:86400000}",
                initialDelayString = "${storage.reclaim.initial-delay-ms:300000}")
     public void reclaimOrphanObjects() {
-        if (!enabled) {
-            log.debug("孤儿对象回收已禁用（storage.reclaim.enabled=false），跳过");
+        if (mode == ReclaimMode.DISABLED) {
+            log.debug("孤儿对象回收已关闭");
             return;
         }
+
         Set<String> referenced;
 
         try {
             referenced = new HashSet<>(documentMapper.selectAllFilePaths());
         } catch (Exception e) {
-            log.error("孤儿对象回收：读取 document.file_path 失败，本轮一个对象都不删", e);
+            log.error("读取 document.file_path 失败，跳过本轮回收扫描", e);
+            return;
+        }
+        if (referenced.isEmpty()) {
+            log.warn("数据库未返回文档对象引用，跳过本轮回收扫描");
             return;
         }
 
@@ -82,11 +93,32 @@ public class MinioReclaimService {
         try {
             staleKeys = listKeysOlderThan(cutoff);
         } catch (Exception e) {
-            log.error("孤儿对象回收：列 bucket 失败，本轮一个对象都不删", e);
+            log.error("读取 MinIO 对象列表失败，跳过本轮回收扫描", e);
             return;
         }
 
         Set<String> orphans = MinioReclaimPlanner.findOrphans(staleKeys, referenced);
+        if (mode == ReclaimMode.DRY_RUN) {
+            for (String key : orphans) {
+                log.info("孤儿对象预览 object={} bucket={}", key, bucketName);
+            }
+            log.info("孤儿对象预览完成 bucket={} 宽限期={}h 候选数={}", bucketName, gracePeriodHours, orphans.size());
+            return;
+        }
+
+        int deleted = deleteOrphans(orphans);
+        log.info("孤儿对象回收完成: 宽限期 {}h, 过宽限期的对象 {} 个, DB 引用 {} 条, 判定孤儿 {} 个, 删除 {} 个",
+                gracePeriodHours, staleKeys.size(), referenced.size(), orphans.size(), deleted);
+    }
+
+    /**
+     * 在删除模式下逐个移除已确认的候选对象，单个失败时继续处理。
+     * 由 reclaimOrphanObjects 调用，删除操作交给 MinIO 客户端。
+     *
+     * @param orphans 通过宽限期和引用检查的对象键
+     * @return 成功删除的对象数
+     */
+    private int deleteOrphans(Set<String> orphans) {
         int deleted = 0;
 
         for (String key : orphans) {
@@ -99,8 +131,7 @@ public class MinioReclaimService {
                 log.warn("孤儿对象删除失败（下轮再试）: object={}", key, e);
             }
         }
-        log.info("孤儿对象回收完成: 宽限期 {}h, 过宽限期的对象 {} 个, DB 引用 {} 条, 判定孤儿 {} 个, 删除 {} 个",
-                gracePeriodHours, staleKeys.size(), referenced.size(), orphans.size(), deleted);
+        return deleted;
     }
 
     /**
@@ -123,5 +154,28 @@ public class MinioReclaimService {
             }
         }
         return staleKeys;
+    }
+
+    private enum ReclaimMode {
+        DISABLED, DRY_RUN, DELETE;
+
+        /**
+         * 在服务装配时解析显式模式，缺省时兼容原有开关。
+         *
+         * @param configuredMode 三种模式之一，允许空值
+         * @param legacyEnabled 缺省模式下是否沿用原有删除行为
+         * @return 此服务使用的回收模式
+         */
+        private static ReclaimMode resolve(String configuredMode, boolean legacyEnabled) {
+            if (configuredMode == null || configuredMode.isBlank()) {
+                return legacyEnabled ? DELETE : DISABLED;
+            }
+            return switch (configuredMode.strip()) {
+                case "disabled" -> DISABLED;
+                case "dry-run" -> DRY_RUN;
+                case "delete" -> DELETE;
+                default -> throw new IllegalArgumentException("storage.reclaim.mode 必须为 disabled、dry-run 或 delete");
+            };
+        }
     }
 }

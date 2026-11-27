@@ -6,6 +6,7 @@ from typing import List
 from docx import Document
 from docx.table import Table
 
+from ai.app.models.cancellation import check_cancelled
 from ai.app.parser.blocks import Block, BlockType
 
 
@@ -19,6 +20,7 @@ def extract_blocks(path: str) -> List[Block]:
     table_seq = 0
     # 顶层段落和表格共用正文顺序，表格随其前面的标题进入同一章节。
     for item in doc.iter_inner_content():
+        check_cancelled()
         if isinstance(item, Table):
             table_seq += 1
             rows = [[c.text.strip() for c in row.cells] for row in item.rows]

@@ -6,7 +6,10 @@ import subprocess
 from threading import BoundedSemaphore
 from time import monotonic
 
+from ai.app.models.cancellation import check_cancelled
 from ai.app.parser.errors import PdfOcrUnavailable
+from ai.app.parser.subprocess_runner import run_parser_command
+from ai.app.rag.deadline import QueryDeadlineExceeded
 
 
 OCR_MAX_SCAN_PAGES = 30
@@ -20,9 +23,15 @@ def extract_scan_text(page, deadline: float) -> str:
 
     上游为 `ai.app.parser.pdf_parser.extract_blocks`，下游调用 `ai.app.parser.errors.PdfOcrUnavailable`。
     """
-    if not _OCR_SLOTS.acquire(timeout=max(0, deadline - monotonic())):
-        raise PdfOcrUnavailable("扫描页 OCR 当前繁忙，请稍后重试")
+    while True:
+        check_cancelled()
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise PdfOcrUnavailable("扫描页 OCR 当前繁忙，请稍后重试")
+        if _OCR_SLOTS.acquire(timeout=min(0.1, remaining)):
+            break
     try:
+        check_cancelled()
         longest_side = max(page.width, page.height, 1)
         resolution = min(220, int(72 * _MAX_RENDER_SIDE / longest_side))
         if resolution < 20:
@@ -36,12 +45,14 @@ def extract_scan_text(page, deadline: float) -> str:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise PdfOcrUnavailable("扫描页 OCR 超时，请分拆 PDF 后重试")
-            result = subprocess.run(
+            result = run_parser_command(
                 ["tesseract", "stdin", "stdout", "-l", "chi_sim+eng"],
-                input=png.getvalue(), capture_output=True, check=True,
+                input=png.getvalue(), check=True,
                 timeout=min(20, remaining), env={**os.environ, "OMP_THREAD_LIMIT": "1"},
             )
         return result.stdout.decode("utf-8").strip()
+    except QueryDeadlineExceeded:
+        raise
     except subprocess.TimeoutExpired as exc:
         raise PdfOcrUnavailable("扫描页 OCR 超时，请分拆 PDF 后重试") from exc
     except (OSError, subprocess.CalledProcessError) as exc:

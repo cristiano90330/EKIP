@@ -10,6 +10,7 @@ import { contextCapacityMessage, normalizeRagStreamResult, safeRagReasonCode, ty
 import { useAuth } from '../stores/auth'
 
 const RAG_CLIENT_TIMEOUT_MS = 300_000
+const RAG_CANCEL_WAIT_MS = 2_000
 const RAG_TIMEOUT_MESSAGE = '本次问答超过等待时间。请稍后重试；如果持续发生，请缩短问题或联系管理员。'
 const EVIDENCE_THRESHOLD_MESSAGE = '证据验证门槛尚未配置，系统没有生成答案。请稍后重试或联系管理员。'
 const STRATEGY_MISMATCH_MESSAGE = '服务未确认本次问答策略，请稍后重试。'
@@ -266,8 +267,8 @@ const sessionsPath = '/rag/sessions'
  * 由 AskView.vue 的 send 触发。
  * 下游调用 RagSessionController 的会话创建入口。
  */
-export const createRagSession = (knowledgeBaseId: number | null): Promise<RagSession> =>
-  http.post<RagSession, RagSession>(sessionsPath, { knowledgeBaseId })
+export const createRagSession = (knowledgeBaseId: number | null, signal?: AbortSignal): Promise<RagSession> =>
+  http.post<RagSession, RagSession>(sessionsPath, { knowledgeBaseId }, { signal })
 
 /**
  * 按偏移量读取当前账号的问答会话目录。
@@ -326,19 +327,10 @@ export interface AskStreamHandlers {
 }
 
 /**
- * POST /knowledge/ask/stream → SSE 流式问答。
- *
- *   - `done` 帧给 Python 结果，evidenceSources 映射为页面 sources，原始候选仅供诊断；
- *
- * 流式仅支持 `pipelineEngine=fixed`（后端与 Python 一致口径），其它引擎自动退回一次性接口，
- * 避免「选了 langchain 却收到 400」的体验断裂。
- */
-
-/**
- * 按编排引擎和会话类型选择流式或同步 RAG 请求。
+ * 按会话类型选择 SSE 入口，模拟模式沿用完整结果。
  * 接收问题正文、编排引擎、事件处理回调、取消信号、RAG 策略、会话 ID，返回带业务终态的问答结果。
  * 由 AskView.vue 的 send 触发。
- * 下游调用 requestRagAnswer、askKnowledge。
+ * 下游调用 readKnowledgeStream、askKnowledge。
  */
 export async function askKnowledgeStream(
   question: string,
@@ -348,27 +340,74 @@ export async function askKnowledgeStream(
   strategy?: RagStrategy,
   sessionId?: string,
 ): Promise<KnowledgeAskResponseDTO> {
-  if (USE_MOCK || pipelineEngine !== 'fixed') {
-    return sessionId && !USE_MOCK
-      ? requestRagAnswer(`${sessionsPath}/${encodeURIComponent(sessionId)}/ask`, { question, pipelineEngine, strategy }, signal)
-      : askKnowledge(question, pipelineEngine, signal, strategy)
+  if (USE_MOCK) return askKnowledge(question, pipelineEngine, signal, strategy)
+
+  if (!sessionId || !signal) {
+    return withRagDeadline(
+      requestSignal => readKnowledgeStream(question, pipelineEngine, handlers, requestSignal, strategy, sessionId),
+      signal,
+    )
   }
 
-  return withRagDeadline(requestSignal => readKnowledgeStream(question, handlers, requestSignal, strategy, sessionId), signal)
+  signal.throwIfAborted()
+  const transport = new AbortController()
+  let turnId: string | null = null
+  let stopping: Promise<void> | undefined
+  let handshakeTimer: ReturnType<typeof setTimeout> | undefined
+
+  // 保留响应头握手，拿到本轮标识后再通知服务端停机，避免同会话抢跑。
+  const stop = () => {
+    if (stopping) return
+    if (!turnId) {
+      handshakeTimer = setTimeout(() => transport.abort(signal.reason), RAG_CANCEL_WAIT_MS)
+      return
+    }
+    clearTimeout(handshakeTimer)
+    const url = `/api/knowledge/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/cancel`
+    stopping = fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${useAuth().token}` },
+      keepalive: true,
+      signal: AbortSignal.timeout(RAG_CANCEL_WAIT_MS),
+    }).then((response) => {
+      if (!response.ok) throw new Error('取消未得到服务端确认')
+    }).catch(async () => {
+      transport.abort(signal.reason)
+      // 控制请求失败时，给 SSE 心跳留出发现断连的时间。
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_000))
+    }).finally(() => transport.abort(signal.reason))
+  }
+
+  signal.addEventListener('abort', stop, { once: true })
+  try {
+    const result = await withRagDeadline(requestSignal =>
+      readKnowledgeStream(question, pipelineEngine, handlers, requestSignal, strategy, sessionId, (id) => {
+        turnId = id
+        if (signal.aborted && turnId) stop()
+      }), transport.signal)
+    signal.throwIfAborted()
+    return result
+  } finally {
+    signal.removeEventListener('abort', stop)
+    clearTimeout(handshakeTimer)
+    await stopping
+  }
 }
 
 /**
- * 读取 RAG 上下文、正文和终态帧，对错误或缺失终态返回失败。
- * 接收问题正文、事件处理回调、取消信号、RAG 策略、会话 ID。
+ * 读取 RAG 上下文、正文和终态帧，将成功终态的获准证据映射为页面来源。
+ * 接收问题正文、编排引擎、事件处理回调、取消信号、RAG 策略、会话 ID，返回最终问答结果。
  * 由 askKnowledgeStream 触发。
  * 下游调用 KnowledgeChatStreamController 的单轮或服务端会话入口、auth 的 useAuth。
  */
 async function readKnowledgeStream(
   question: string,
+  pipelineEngine: PipelineEngine,
   handlers: AskStreamHandlers,
   signal: AbortSignal,
   strategy?: RagStrategy,
   sessionId?: string,
+  onTurn?: (id: string | null) => void,
 ): Promise<KnowledgeAskResponseDTO> {
   const url = sessionId ? `/api/knowledge/sessions/${encodeURIComponent(sessionId)}/ask/stream` : '/api/knowledge/ask/stream'
   const response = await fetch(url, {
@@ -378,13 +417,14 @@ async function readKnowledgeStream(
       Accept: 'text/event-stream',
       Authorization: `Bearer ${useAuth().token}`,
     },
-    body: JSON.stringify({ question, pipelineEngine: 'fixed', strategy }),
+    body: JSON.stringify({ question, pipelineEngine, strategy }),
     signal,
   })
 
   if (!response.ok) {
     throw streamPreflightError(response)
   }
+  onTurn?.(response.headers.get('X-Rag-Turn-Id'))
 
   let done: KnowledgeAskResponseDTO | null = null
   let streamError: RagRequestError | null = null

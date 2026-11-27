@@ -8,8 +8,9 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict
+from uuid import uuid4
 
 import httpx
 from openai import OpenAI, Stream, omit, APIError, APIStatusError, APIConnectionError, APITimeoutError
@@ -17,6 +18,7 @@ from openai import OpenAI, Stream, omit, APIError, APIStatusError, APIConnection
 from ai.app.llm.chat_result import ChatResult
 from ai.app.models.context import binding
 from ai.app.models.cancellation import check_cancelled, wait_or_cancel
+from ai.app.models.resource_leases import RedisGroupLeases, ResourceCoordinationError
 from ai.app.models.resolution import ModelConfigurationError, effective_compat, endpoint
 from ai.app.models.schema import ModelConfig
 from ai.app.models.transport import CapacityExceeded, run_bounded, stream_bounded, state as io_state
@@ -48,7 +50,7 @@ def identity(model: ModelConfig) -> str:
 class ResourceLimits:
     """Model capacities and deployment device capacities are independent."""
 
-    def __init__(self, groups=None, queue_limit=None):
+    def __init__(self, groups=None, queue_limit=None, *, shared=None):
         """校验设备分组配额和等待队列上限，建立模型与资源组的占用计数。"""
         if groups is None:
             try:
@@ -65,6 +67,10 @@ class ResourceLimits:
             raise ModelConfigurationError("invalid model resource queue limit") from None
         if isinstance(self.queue_limit, bool) or not isinstance(self.queue_limit, int) or not 0 <= self.queue_limit <= 256:
             raise ModelConfigurationError("invalid model resource queue limit")
+        redis_url = os.getenv("MODEL_RESOURCE_REDIS_URL", "").strip()
+        namespace = os.getenv("MODEL_RESOURCE_REDIS_NAMESPACE", "").strip() or "ekip"
+        self._shared = shared if shared is not None else (
+            RedisGroupLeases.connect(redis_url, namespace) if redis_url else None)
         self._condition = threading.Condition()
         self._active, self._waiting = {}, 0
 
@@ -82,28 +88,52 @@ class ResourceLimits:
             if group not in self.groups:
                 raise ModelConfigurationError("model resource group is not configured")
             capacities["group:" + group] = self.groups[group]
+        shared_slot = self._shared_slot(group, model.runtime.timeoutMs) if group and self._shared else nullcontext()
+        with self._local_slot(capacities), shared_slot:
+            self._check_waiting_request()
+            yield
+
+    @staticmethod
+    def _check_waiting_request():
+        """在尝试占用及进入模型调用前检查取消和请求预算。"""
+        check_cancelled()
+        if deadline_expired():
+            raise QueryDeadlineExceeded("model resource wait exceeded total budget")
+
+    def _wait_for(self, try_acquire):
+        """在同一进程等待计数下，等待本地槽位或 Redis 共享槽位。"""
+        self._check_waiting_request()
+        if try_acquire():
+            return
         with self._condition:
-            waiting = False
-            try:
-                while any(self._active.get(k, 0) >= limit for k, limit in capacities.items()):
-                    check_cancelled()
-                    if not waiting:
-                        if self._waiting >= self.queue_limit:
-                            raise ModelCallError("model_resource_capacity_rejected", transient=True)
-                        self._waiting += 1
-                        waiting = True
-                    remaining = remaining_seconds()
-                    if remaining is not None and remaining <= 0:
-                        raise QueryDeadlineExceeded("model resource wait exceeded total budget")
+            if self._waiting >= self.queue_limit:
+                raise ModelCallError("model_resource_capacity_rejected", transient=True)
+            self._waiting += 1
+        try:
+            while True:
+                self._check_waiting_request()
+                remaining = remaining_seconds()
+                with self._condition:
                     self._condition.wait(timeout=min(remaining, 0.1) if remaining is not None else 0.1)
-                check_cancelled()
-                if deadline_expired():
-                    raise QueryDeadlineExceeded("model resource wait exceeded total budget")
-                for key in capacities:
-                    self._active[key] = self._active.get(key, 0) + 1
-            finally:
-                if waiting:
-                    self._waiting -= 1
+                self._check_waiting_request()
+                if try_acquire():
+                    return
+        finally:
+            with self._condition:
+                self._waiting -= 1
+
+    @contextmanager
+    def _local_slot(self, capacities):
+        """在条件锁内同时申请并归还本进程的模型和资源组槽位。"""
+        def try_acquire():
+            if any(self._active.get(key, 0) >= limit for key, limit in capacities.items()):
+                return False
+            for key in capacities:
+                self._active[key] = self._active.get(key, 0) + 1
+            return True
+
+        with self._condition:
+            self._wait_for(try_acquire)
         try:
             yield
         finally:
@@ -113,6 +143,20 @@ class ResourceLimits:
                     if self._active[key] == 0:
                         del self._active[key]
                 self._condition.notify_all()
+
+    @contextmanager
+    def _shared_slot(self, group, attempt_timeout_ms):
+        """持有共享租约。进程意外退出时，租约在尝试上限加宽限期后回收。"""
+        token = uuid4().hex
+        ttl_ms = attempt_timeout_ms + 30_000
+        try:
+            self._wait_for(lambda: self._shared.try_acquire(group, self.groups[group], token, ttl_ms))
+        except ResourceCoordinationError as exc:
+            raise ModelCallError(str(exc), transient=True) from None
+        try:
+            yield
+        finally:
+            self._shared.release(group, token)
 
 
 class ModelRuntime:
@@ -404,7 +448,7 @@ class ModelRuntime:
                              stream_cls=Stream[Dict[str, Any]], options={"timeout": bounded_timeout(600),
                                  "headers": {"Authorization": headers.get("Authorization", omit)}}) as stream:
                 if io_state() is not None:
-                    io_state().attach(stream)
+                    io_state().attach(stream, stream_response=stream.response)
                 self._status(stream.response)
                 yield from stream
         except APITimeoutError:

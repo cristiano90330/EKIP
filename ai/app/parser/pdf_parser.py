@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 
 import pdfplumber
 
+from ai.app.models.cancellation import check_cancelled
 from ai.app.parser.blocks import Block, BlockType
 from ai.app.parser.errors import DocumentInputError
 from ai.app.parser.pdf_ocr import OCR_DOCUMENT_BUDGET_S, OCR_MAX_SCAN_PAGES, extract_scan_text
@@ -78,6 +79,7 @@ def extract_blocks(path: str) -> List[Block]:
         pages: List[Tuple[int, list, List[dict]]] = []
         scan_pages: set[int] = set()
         for pno, page in enumerate(pdf.pages, 1):
+            check_cancelled()
             page_words = page.extract_words(extra_attrs=["size"])
             if _is_scan(page, page_words):
                 scan_pages.add(pno)
@@ -95,6 +97,7 @@ def extract_blocks(path: str) -> List[Block]:
         body_size = _body_size([ws for _, _, ws in pages])
         # 第二遍：按行识别标题/段落，再将文字与表格按页内位置合并。
         for pno, tables, words in pages:
+            check_cancelled()
             if pno in scan_pages:
                 text = extract_scan_text(pdf.pages[pno - 1], ocr_deadline)
                 if text:
@@ -103,6 +106,7 @@ def extract_blocks(path: str) -> List[Block]:
             positioned_blocks: List[Tuple[float, float, Block]] = []
             # 单栏页从上到下排列，表格编号每页从 1 开始。
             for seq, t in enumerate(sorted(tables, key=lambda t: (t.bbox[1], t.bbox[0])), 1):
+                check_cancelled()
                 rows = [[(c or "").strip() for c in r] for r in t.extract()]
                 positioned_blocks.append((t.bbox[1], t.bbox[0],
                                           Block(type=BlockType.TABLE, text="", page=pno,

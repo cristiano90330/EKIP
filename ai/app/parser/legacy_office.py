@@ -4,9 +4,12 @@ import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import Optional, Tuple
 
 from ai.app.parser.errors import DocumentInputError
+from ai.app.parser.subprocess_runner import run_parser_command
+from ai.app.rag.deadline import QueryDeadlineExceeded
 
 # OLE2 复合文档头（Word 97-2003 / PowerPoint 97-2003 共用）。
 _OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
@@ -57,10 +60,15 @@ def convert_legacy(path: str, extension: str) -> Tuple[str, str]:
 
     workdir = tempfile.mkdtemp(prefix="ekip-office-")
     try:
-        completed = subprocess.run(  # noqa: S603 — 参数为固定列表，无 shell
-            [binary, "--headless", "--convert-to", target, "--outdir", workdir, path],
-            capture_output=True, timeout=180, check=False,
+        profile_uri = (Path(workdir) / "profile").as_uri()
+        completed = run_parser_command(
+            [binary, "-env:UserInstallation=" + profile_uri, "--headless",
+             "--convert-to", target, "--outdir", workdir, path],
+            timeout=180, check=False,
         )
+    except QueryDeadlineExceeded:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
     except (OSError, subprocess.SubprocessError) as exc:
         shutil.rmtree(workdir, ignore_errors=True)
         raise DocumentInputError(

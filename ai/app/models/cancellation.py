@@ -12,6 +12,11 @@ from ai.app.rag.deadline import (QueryDeadlineExceeded, reset_request_started_at
 _cancelled: ContextVar[Event | None] = ContextVar("model_request_cancelled", default=None)
 
 
+def current_cancellation_event() -> Event | None:
+    """返回当前请求的取消事件，让 RAG 流的生产者和消费者同时收到断连信号。"""
+    return _cancelled.get()
+
+
 def check_cancelled():
     """读取当前模型操作的取消信号，已取消时抛出对应异常使工作线程停止。
 
@@ -66,7 +71,7 @@ class ModelCancellationMiddleware:
         """
         path = scope.get("path", "")
         if scope.get("type") != "http" or not path.startswith(
-                ("/agent/", "/rag/", "/embedding", "/models/test", "/evaluation/")):
+                ("/agent/", "/rag/", "/embedding", "/models/test", "/evaluation/", "/parser/")):
             await self.app(scope, receive, send)
             return
         event, messages = Event(), asyncio.Queue(maxsize=1)

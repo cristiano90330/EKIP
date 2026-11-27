@@ -13,7 +13,7 @@ EKIP 把分散在制度、手册和项目文档里的知识整理成可搜索的
 ## 核心功能
 
 - **文档入库**。创建和共享知识库，上传 PDF、Office 文档或 Markdown，查看解析进度和分块正文。扫描 PDF 支持 OCR，文档任务支持取消和重试。
-- **带原文引用的 RAG 问答**。在当前用户可读的知识库范围内做向量与关键词混合检索，可选重排。回答使用通过审查的证据，证据不足时明确说明；支持固定流程和 LangChain。
+- **带原文引用的 RAG 问答**。在当前用户可读的知识库范围内做向量与关键词混合检索，可选重排。回答使用通过审查的证据，证据不足时明确说明。固定流程和 LangChain 都支持 SSE，LangChain 可在生成过程中展示正文，终态确认答案与引用。
 - **Agent 工具调用**。Agent 可在授权范围内检索和阅读文档，页面展示工具执行过程与引用来源。支持服务端会话和经用户审批的长期记忆。
 
 Chat、Embedding 和 Rerank 可以分别接入本地或云端模型。Trace 页面可查看各阶段耗时、实际检索策略和证据判定。模型配置和详细模块说明见[文档入口](docs/README.md)。
@@ -205,7 +205,7 @@ flowchart LR
 
 **文档入库**：Java 校验权限并上传 MinIO → 建立文档与异步任务 → Python 解析切块 → Java 调用 Embedding 并在事务内替换片段。业务表与片段同库，数据库结构由 Flyway 管理。
 
-**问答执行**：Java 授权并装配知识库范围 → 一次调用 Python `/rag/query` → 改写、检索、融合、重排、证据准入、可选后处理与生成 → Java 映射答案、来源和 Trace。Python 使用专用只读角色，内部接口由 `X-Internal-Token` 保护。
+**问答执行**。Java 授权并装配知识库范围 → 调用 Python 的同步 `/rag/query` 或流式 `/rag/query/stream` → 改写、检索、融合、重排、证据准入、可选后处理与生成 → Java 转发阶段、答案、来源和 Trace。Python 使用专用只读角色，内部接口由 `X-Internal-Token` 保护。
 
 ### 检索策略与可选处理
 
@@ -307,6 +307,7 @@ npm run build
 - **代理与登录**：可信反向代理需正确传递 `X-Forwarded-For`，以便按客户端 IP 限流。轮换 `JWT_SECRET` 后需重启后端，已签发访问令牌会失效。
 - **端口**：标准端口为 5432 / 6379 / 8000 / 8080 / 9000–9001。Windows 绑定失败时先用 `netsh int ipv4 show excludedportrange protocol=tcp` 排查保留端口；容器与本机服务避免占用同一端口。
 - **部署范围**。多实例文档任务的租约恢复与 SSE 状态广播见[文档任务](docs/architecture/modules/tasks.md)。生产部署应替换 Compose 使用的本地开发存储凭据及访问配置。
+- **对象回收**。MinIO 孤儿对象回收默认关闭。设置 `STORAGE_RECLAIM_MODE=dry-run` 后，服务按现有宽限期扫描，由日志列出候选对象和总数。回收配置见[后端手册](knowledge-platform/README.md)。
 
 <a id="validation"></a>
 

@@ -142,18 +142,12 @@ minio:
   secret-key: ${MINIO_SECRET_KEY:12345678}
   bucket-name: ${MINIO_BUCKET:knowledge-files}
 
-# ---------- 对象存储孤儿回收（第 01 章 3.1 P2-16）----------
-# 删文档选了「先删 DB、MinIO 失败只 log.error」（P1-6 的必需配套），代价是必然累积
-# 「DB 已无记录、文件还在 bucket」的孤儿对象。MinioReclaimService 定期列 bucket 与
-# document.file_path 对账后回收。四个值须与 MinioReclaimService 的 @Value 默认值一致。
+# MinioReclaimService 定期对照 document.file_path 与对象列表，处理文档删除后的遗留对象。
 storage:
   reclaim:
-    # 🔴 默认关闭：它每天删数据，开启必须是有意识的决定。
-    # ⚠️ 本任务没有 dry-run 档：enabled=false 时 reclaimOrphanObjects() 在方法开头直接 return、
-    #    连 bucket 都不列（只打一行 debug）；enabled=true 时算出孤儿立刻删。
-    #    所以「先看清单再决定」这两档都给不了——要预检请走只读对账：
-    #    `SELECT file_path FROM document` 与 bucket 清单（mc ls / boto3 list_objects）做 diff。
-    #    真正的 dry-run 档尚未实现。
+    # disabled 关闭，dry-run 记录候选清单和总数，delete 删除候选对象。
+    # mode 留空时沿用旧开关，enabled=true 时执行删除，默认关闭。
+    mode: "${STORAGE_RECLAIM_MODE:}"
     enabled: ${STORAGE_RECLAIM_ENABLED:false}
     # 宽限期：挡住「MinIO 已上传、document 行还没提交」的窗口，别调小于一次上传的最长耗时
     grace-period-hours: ${STORAGE_RECLAIM_GRACE_HOURS:24}

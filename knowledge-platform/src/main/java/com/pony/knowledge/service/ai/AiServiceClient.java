@@ -62,6 +62,7 @@ public class AiServiceClient {
     private ModelRegistryService modelRegistry;
     private CurrentUserUtil currentUser;
     private final ThreadLocal<AtomicReference<Closeable>> activeResponse = new ThreadLocal<>();
+    private final ThreadLocal<DocumentParseCancellation> activeParse = new ThreadLocal<>();
 
     /**
      * 注入用于解析默认模型与当前用户执行配置的服务。
@@ -151,11 +152,16 @@ public class AiServiceClient {
 
         String target = request.getMethod() + " " + request.getURI();
         long startedAt = System.nanoTime();
+        DocumentParseCancellation parse = activeParse.get();
 
         try {
             ClientHttpResponse response = execution.execute(request, body);
             AtomicReference<Closeable> closing = activeResponse.get();
             if (closing != null) closing.set(response::close);
+            if (parse != null && !parse.trackResponse(response)) {
+                DocumentParseCancellation.abortResponse(response);
+                throw new java.util.concurrent.CancellationException("文档解析尝试已取消");
+            }
             if (Thread.currentThread().isInterrupted()) {
                 response.close();
                 throw new java.net.http.HttpTimeoutException("模型请求已取消");
@@ -181,7 +187,7 @@ public class AiServiceClient {
             log.warn("← Python {} 失败 耗时={}ms requestId={} err={}",
                     target, elapsedMillis(startedAt), rid, e.getClass().getSimpleName());
             // 连接不可达记失败；读取超时等其他异常按分类器规则记中性。
-            if (AiFailureClassifier.isUnreachable(e)) {
+            if ((parse == null || !parse.isCancelled()) && AiFailureClassifier.isUnreachable(e)) {
                 circuitCall.failure();
             } else {
                 circuitCall.ignore();
@@ -298,6 +304,29 @@ public class AiServiceClient {
                 .retrieve()
                 .body(ParseResult.class);
 
+    }
+
+    /**
+     * 在文档尝试的取消作用域内执行对象解析，复用普通解析的请求体、鉴权和超时。
+     * 上游为 DocumentProcessServiceImpl，响应体由内部 HTTP 拦截器登记。
+     *
+     * @param documentId 文档 ID
+     * @param objectName 原文件对象键
+     * @param bucketName 对象桶名
+     * @param fileExtension 原文件扩展名
+     * @param cancellation 当前文档尝试的取消信号
+     * @return Python 返回的解析结果
+     */
+    public ParseResult parseDocument(Long documentId, String objectName, String bucketName, String fileExtension,
+                                     DocumentParseCancellation cancellation) {
+        cancellation.start();
+        activeParse.set(cancellation);
+        try {
+            return parseDocument(documentId, objectName, bucketName, fileExtension);
+        } finally {
+            activeParse.remove();
+            cancellation.finish();
+        }
     }
 
     /** 对象解析请求，由 Python 按桶和对象名读取原文件。 */

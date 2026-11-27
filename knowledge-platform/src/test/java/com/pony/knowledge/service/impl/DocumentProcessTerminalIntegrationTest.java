@@ -75,7 +75,7 @@ class DocumentProcessTerminalIntegrationTest {
                 """, Long.class, kbId);
         taskId = jdbc.queryForObject("INSERT INTO document_task(document_id, status) VALUES (?, 0) RETURNING id",
                 Long.class, documentId);
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenReturn(new AiServiceClient.ParseResult());
         when(chunks.completeTask(any(), anyLong(), any())).thenAnswer(invocation ->
                 new TransactionTemplate(transactions).execute(status ->
@@ -230,7 +230,7 @@ class DocumentProcessTerminalIntegrationTest {
     /** 通过 {@code jdbc.update} 驱动用例，核对 {@code tasks.selectById(taskId).getStatus()} 等于 {@code DocumentTaskStatus.PROCESSING}、{@code documents.selectById(documentId).getStatus()} 等于 {@code DocumentStatus.PROCESSING}。 */
     @Test
     void retryScheduleRejectionCannotLeaveWaitingTaskWithProcessingDocument() {
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new org.springframework.web.client.ResourceAccessException("temporary parser outage"));
         doThrow(new java.util.concurrent.RejectedExecutionException("retry timer unavailable"))
                 .when(dispatchCoordinator).scheduleRetry(any(), anyLong());
@@ -263,7 +263,7 @@ class DocumentProcessTerminalIntegrationTest {
     /** 通过 {@code ai.parseDocument}、{@code process.process} 驱动该场景，核对 {@code task.getStatus()} 等于 {@code DocumentTaskStatus.WAITING}、{@code documents.selectById(documentId).getStatus()} 等于 {@code DocumentStatus.UPLOADED}。 */
     @Test
     void retryScheduleRejectionCommitsBothWaitingRowsAndKeepsParserFailure() {
-        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString()))
+        when(ai.parseDocument(anyLong(), anyString(), anyString(), anyString(), any()))
                 .thenThrow(new org.springframework.web.client.ResourceAccessException("temporary parser outage"));
         doThrow(new java.util.concurrent.RejectedExecutionException("retry timer unavailable"))
                 .when(dispatchCoordinator).scheduleRetry(any(), anyLong());

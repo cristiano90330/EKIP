@@ -131,20 +131,30 @@ public class RagSessionService {
     }
 
     /**
-     * 为指定库的回合取最近问答作为生成历史。
+     * 在已授权的会话范围内取最近三个完成回合，供单库和全库追问使用。
      * 上游为 KnowledgeChatStreamController.streamSession、RagSessionController.ask。
-     * 下游为 TurnLease.scoped、TurnLease.id。
+     * 下游为 RagSessionService.requireCurrentScope、RagSessionService.contextAnswer。
      *
      * @param lease 本次取得的处理或问答回合租约
      * @return 与过滤条件匹配的 List&lt;ChatMessage&gt; 数据集合
      */
     public List<ChatMessage> context(TurnLease lease) {
-        if (!lease.scoped()) return List.of();
+        Session session = jdbc.query("""
+                SELECT * FROM rag_session WHERE id=? AND user_id=? AND active_turn=? AND active_until>=now()
+                """, (rs, row) -> session(rs), lease.id(), lease.userId(), lease.token())
+                .stream().findFirst().orElseThrow(RagSessionService::denied);
+        if (!session.scopeKey().equals(scopeKey(lease.scope()))) throw denied();
+        requireCurrentScope(lease.userId(), session);
+        if (lease.scope().isEmpty()) return List.of();
+
         List<Turn> recent = jdbc.query("""
                 SELECT id,question,response,created_at FROM rag_session_turn
                 WHERE session_id=? ORDER BY id DESC LIMIT 3
                 """, (rs, row) -> new Turn(rs.getLong("id"), rs.getString("question"),
                 parse(rs.getString("response")), rs.getTimestamp("created_at").getTime()), lease.id());
+
+        // 读取历史期间授权可能发生变化。向调用方返回历史前，再对比会话范围快照。
+        requireCurrentScope(lease.userId(), session);
         Collections.reverse(recent);
         return recent.stream().flatMap(turn -> java.util.stream.Stream.of(
                 message("user", turn.question()),
@@ -197,8 +207,13 @@ public class RagSessionService {
      * @param lease 本次取得的处理或问答回合租约
      */
     public void end(TurnLease lease) {
+        end(lease.userId(), lease.id(), lease.token());
+    }
+
+    /** 仅释放指定账号、会话和回合的执行权。重复调用不会影响下一轮。 */
+    public void end(long userId, UUID sessionId, UUID turnId) {
         jdbc.update("UPDATE rag_session SET active_turn=NULL,active_until=NULL WHERE id=? AND user_id=? AND active_turn=?",
-                lease.id(), lease.userId(), lease.token());
+                sessionId, userId, turnId);
     }
 
     /**
@@ -212,8 +227,19 @@ public class RagSessionService {
      */
     private Session authorized(long userId, UUID id) {
         Session session = owned(userId, id);
-        if (!session.scopeKey().equals(scopeKey(resolveScope(userId, session.knowledgeBaseId())))) throw denied();
+        requireCurrentScope(userId, session);
         return session;
+    }
+
+    /**
+     * 对比当前可读范围和会话创建时的范围，变化时拒绝使用该会话。
+     * 上游为 authorized、context，下游为 resolveScope。
+     *
+     * @param userId 会话账号 ID
+     * @param session 含有固定范围快照的会话
+     */
+    private void requireCurrentScope(long userId, Session session) {
+        if (!session.scopeKey().equals(scopeKey(resolveScope(userId, session.knowledgeBaseId())))) throw denied();
     }
 
     /**
@@ -334,5 +360,9 @@ public class RagSessionService {
     public record SessionPage(List<SessionView> items, Integer nextOffset) { }
     public record Turn(long id, String question, JsonNode response, long createdAt) { }
     public record TurnPage(List<Turn> items, Long nextBeforeId) { }
-    public record TurnLease(UUID id, long userId, UUID token, List<Long> scope, boolean scoped) { }
+    public record TurnLease(UUID id, long userId, UUID token, List<Long> scope, boolean scoped) {
+        public TurnLease {
+            scope = List.copyOf(scope);
+        }
+    }
 }

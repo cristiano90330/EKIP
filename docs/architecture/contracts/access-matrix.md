@@ -96,7 +96,7 @@ Java 通过 `AiServiceClient` 调用内部 AI；Agent 决策使用独立 `AgentG
 | 入口 | 当前检查与范围 | 边界 |
 | --- | --- | --- |
 | `GET /document/{id}/chunks` | 服务读取实际文档并核对创建者/成员权限，分页省略向量字段 | 不存在/无权限统一 403；重处理期间不保证跨页快照 |
-| `POST /knowledge/ask/stream` | 与同步问答共享可信身份及授权范围，固定线程池传播 SecurityContext | 仅 fixed，langchain 400；建立流后的取消与完成依据终帧和持久结果 |
+| `POST /knowledge/ask/stream`、`POST /knowledge/sessions/{id}/ask/stream` | Java 从当前用户和会话核定可读范围，固定线程池传播 SecurityContext | 支持 `fixed / langchain`。LangChain 临时正文不写历史，完成回合以终帧和持久结果为准 |
 | `POST /agent/chat/stream` | 服务端会话、用户/Agent/策略指纹复核；工具前单调收缩范围 | 完成先保存再发送 done，取消半段不存为完成历史 |
 | `list_documents` / `read_document` | 工具复用本轮授权范围，文档 ID 按实际所属 KB 核对；Python SQL 同时绑定 KB/documentId | 只列已完成文档；page 模式有界窗口仍走准入，游标和内容偏移不扩大范围 |
 

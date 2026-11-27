@@ -4,6 +4,7 @@ package com.pony.knowledge.agent.tool.knowledge;
 
 import com.pony.knowledge.service.rag.model.RagQueryOutcome;
 import com.pony.knowledge.service.rag.model.DocumentReadWindow;
+import com.pony.knowledge.service.rag.query.ChatMessage;
 
 import java.util.List;
 
@@ -36,12 +37,15 @@ public interface DocumentScopedEvidenceReader {
      *
      * @param knowledgeBaseIds 本次调用传入的 {@code List<Long>}
      * @param documentId 目标文档 ID
-     * @param query 待检索或组织上下文的查询文本
+     * @param question 使用本轮原问核对证据范围
+     * @param history 已获授权且用于理解原问的会话历史
+     * @param retrievalQuery 工具提供的短查询，用于检索和重排
      * @param window 允许读取的窗口范围和字符预算
      * @return 带准入证据和诊断的问答管线结果
      */
     default RagQueryOutcome readPage(List<Long> knowledgeBaseIds, Long documentId,
-                                     String query, DocumentReadWindow window) {
+                                     String question, List<ChatMessage> history,
+                                     String retrievalQuery, DocumentReadWindow window) {
         throw new UnsupportedOperationException("Sequential document reading is unavailable");
     }
 }

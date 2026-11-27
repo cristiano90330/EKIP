@@ -115,7 +115,7 @@ def test_pdf_parser_ocr_preserves_page_for_mixed_document(tmp_path, monkeypatch)
         assert options["input"].startswith(b"\x89PNG")
         return SimpleNamespace(stdout="扫描件原文".encode("utf-8"))
 
-    monkeypatch.setattr(pdf_ocr.subprocess, "run", recognize)
+    monkeypatch.setattr(pdf_ocr, "run_parser_command", recognize)
     assert [(block.page, block.text) for block in pdf_parser.extract_blocks(path)] == [
         (1, "Existing text layer"), (2, "扫描件原文"),
     ]

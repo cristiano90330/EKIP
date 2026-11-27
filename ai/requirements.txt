@@ -5,6 +5,7 @@
 fastapi
 uvicorn
 python-multipart      # FastAPI 文件上传
+pydantic>=2.10,<3       # LangChain SSE 通过 pydantic_core 解码 JSON 中未闭合的正文字符串
 
 # --- 文档解析 ---
 pdfplumber             # PDF 表格/结构解析（ai/app/parser/pdf_parser.py）
@@ -27,6 +28,7 @@ openai>=2.53.0,<3
 # --- 托管模型的 HTTP 客户端 ---
 # openai SDK 已传递依赖 httpx，这里显式声明——我们直接 import 它，不该依赖别人的传递依赖
 httpx
+redis>=5.2,<6          # 可选的跨 AI 进程共享模型资源组租约
 
 # --- RAG 编排：固定流程 / LangChain 共存（生产 LCEL 使用核心标准接口）---
 langchain-core==1.5.3

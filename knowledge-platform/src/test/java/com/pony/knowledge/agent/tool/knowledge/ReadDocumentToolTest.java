@@ -18,6 +18,7 @@ import com.pony.knowledge.service.rag.model.RagEvidence;
 import com.pony.knowledge.service.rag.model.RagQueryOutcome;
 import com.pony.knowledge.service.rag.model.DocumentReadWindow;
 import com.pony.knowledge.service.rag.model.RagDocumentPage;
+import com.pony.knowledge.service.rag.query.ChatMessage;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
@@ -36,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
@@ -365,13 +367,21 @@ class ReadDocumentToolTest {
     /** 构造有后续内容的正文窗口，核对当前页完整输出且下一位置正确。 */
     @Test
     void continuousWindow_preservesCompleteTextAndContinuationWithinDefaultOutputBudget() throws Exception {
+        String question = "柏川项目的报销标准是什么？";
+        AgentExecutionContext turn = context(Set.of(KB_ID));
+        ChatMessage prior = new ChatMessage();
+        prior.setRole("user");
+        prior.setContent("我要查柏川项目的制度");
+        turn.setCurrentQuery(question);
+        turn.setQuestionHistory(List.of(prior));
         Document escapedMetadata = document(DocumentStatus.COMPLETED);
         escapedMetadata.setFileName(String.valueOf((char) 0).repeat(40));
         when(documentMapper.selectReadableInScope(DOCUMENT_ID, List.of(KB_ID)))
                 .thenReturn(escapedMetadata);
-        when(reader.readPage(eq(List.of(KB_ID)), eq(DOCUMENT_ID), eq(QUERY), any()))
+        when(reader.readPage(eq(List.of(KB_ID)), eq(DOCUMENT_ID), eq(question),
+                eq(List.of(prior)), eq(QUERY), any()))
                 .thenAnswer(invocation -> {
-                    DocumentReadWindow window = invocation.getArgument(3);
+                    DocumentReadWindow window = invocation.getArgument(5);
                     // JSON 最坏转义仍须和游标完整交付，不能像 query 模式那样先截正文再跳块。
                     RagEvidence admitted = evidence(7L, DOCUMENT_ID, String.valueOf((char) 0).repeat(window.windowChars()));
                     admitted.setHeadingPath(String.valueOf((char) 0).repeat(40));
@@ -384,7 +394,7 @@ class ReadDocumentToolTest {
                     return result;
                 });
         ToolResult result = tool.execute(ReadDocumentInput.builder().documentId(DOCUMENT_ID)
-                .query(QUERY).mode("page").build(), context(Set.of(KB_ID)));
+                .query(QUERY).mode("page").build(), turn);
         assertTrue(result.isSuccess());
         ReadDocumentOutput output = (ReadDocumentOutput) result.getData();
         assertEquals(0, output.getNextOffset());
@@ -408,7 +418,8 @@ class ReadDocumentToolTest {
         RagQueryOutcome rejected = outcome("no_evidence", List.of(), List.of());
         rejected.setDocumentPage(RagDocumentPage.builder().offset(2).contentOffset(0)
                 .nextOffset(3).nextContentOffset(0).hasMore(true).scannedChars(10).build());
-        when(reader.readPage(eq(List.of(KB_ID)), eq(DOCUMENT_ID), eq(QUERY), any())).thenReturn(rejected);
+        when(reader.readPage(eq(List.of(KB_ID)), eq(DOCUMENT_ID), eq(QUERY),
+                eq(List.of()), isNull(), any())).thenReturn(rejected);
         ReadDocumentInput input = ReadDocumentInput.builder().documentId(DOCUMENT_ID).query(QUERY)
                 .mode("page").offset(2).build();
         ReadDocumentOutput output = (ReadDocumentOutput) tool.execute(input, context(Set.of(KB_ID))).getData();

@@ -10,6 +10,7 @@ import com.pony.knowledge.mapper.DocumentTaskMapper;
 import com.pony.knowledge.service.DocumentChunkService;
 import com.pony.knowledge.service.DocumentProcessService;
 import com.pony.knowledge.service.ai.AiServiceClient;
+import com.pony.knowledge.service.ai.DocumentParseCancellation;
 import com.pony.knowledge.service.task.TaskFailureClassifier;
 import com.pony.knowledge.service.task.TaskFailureKind;
 import com.pony.knowledge.service.task.TaskDispatchCoordinator;
@@ -113,8 +114,9 @@ public class DocumentProcessServiceImpl implements DocumentProcessService {
         if (attempt == null) return;
 
         // 续租覆盖本次解析和切片写入，在工作返回后停止。
-        try (var lease = heartbeat.maintain(attempt)) {
-            processAttempt(taskId, document, attempt);
+        var cancellation = new DocumentParseCancellation();
+        try (var lease = heartbeat.maintain(attempt, cancellation::cancel)) {
+            processAttempt(taskId, document, attempt, cancellation);
         }
     }
 
@@ -126,19 +128,23 @@ public class DocumentProcessServiceImpl implements DocumentProcessService {
      * @param taskId 文档任务 ID
      * @param document 文档记录
      * @param attempt 处理尝试对应的任务快照
+     * @param cancellation 租约失效时用于停止本次 Python 调用的信号
      */
-    private void processAttempt(Long taskId, Document document, DocumentTask attempt) {
+    private void processAttempt(Long taskId, Document document, DocumentTask attempt,
+                                DocumentParseCancellation cancellation) {
         try {
             String fileExtension = FileExtensionUtil.of(document.getFileName());
             AiServiceClient.ParseResult result = aiServiceClient.parseDocument(
-                    document.getId(), document.getFilePath(), bucketName, fileExtension);
+                    document.getId(), document.getFilePath(), bucketName, fileExtension, cancellation);
 
             // 模型调用期间任务可能已取消或被接管，提前拦截迟到结果，最终写入仍以提交事务内的条件为准。
-            if (!TaskCompletionService.isCurrentAttempt(attempt, documentTaskMapper.selectById(taskId))) return;
+            if (cancellation.isCancelled()
+                    || !TaskCompletionService.isCurrentAttempt(attempt, documentTaskMapper.selectById(taskId))) return;
             if (documentChunkService.completeTask(attempt, document.getKnowledgeBaseId(), result.getChunks())) {
                 log.info("文档解析成功, documentId={}, taskId={}", document.getId(), taskId);
             }
         } catch (Exception e) {
+            if (cancellation.isCancelled()) return;
             DocumentTask fresh = documentTaskMapper.selectById(taskId);
             if (!TaskCompletionService.isCurrentAttempt(attempt, fresh)) return;
             int retryCount = fresh.getAutoRetryCount();

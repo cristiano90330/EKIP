@@ -28,6 +28,7 @@ interface ChatMessage {
   content: string
   status: 'pending' | 'done'
   typing?: boolean
+  provisional?: boolean
   progressText?: string
   contextNote?: string
   // 以下为 assistant 专有
@@ -106,7 +107,7 @@ const canSend = computed(() => activeConv.value.available && !activeConv.value.h
 const scopeLabel = computed(() => {
   const { available, knowledgeBaseId } = activeConv.value
   if (!available) return '知识库已不可访问'
-  if (knowledgeBaseId === null) return '全部可读知识库 · 单轮'
+  if (knowledgeBaseId === null) return '全部可读知识库 · 可追问'
   const library = knowledgeBases.value.find(item => item.id === knowledgeBaseId)
   return `${library?.name ?? `知识库 #${knowledgeBaseId}`} · 可追问`
 })
@@ -316,12 +317,8 @@ watch(
   { immediate: true },
 )
 
-// ---------- 打字机（仅回退路径） ----------
-// 问答已改为 SSE 流式（`POST /knowledge/ask/stream`，见 api/knowledge.ts::askKnowledgeStream），
-// 正文由 delta 帧逐字写入，不再需要前端模拟。
-// 这里保留打字机只服务两种回退情形：① `pipelineEngine=langchain`（流式仅支持 fixed）；
-// ② 流式未产出任何正文就以 done 结束。两条路径都只影响前端渲染，不改变后端契约。
-const streams = new Map<string, AbortController>()
+// 模拟模式和没有正文增量的 fixed 终态保留逐步显示效果。
+const streams = new Map<string, { controller: AbortController; settled: Promise<void> }>()
 const typers = new Map<string, ReturnType<typeof setInterval>>()
 
 /** 取消指定消息的逐步显示定时器。接收消息 ID。由 typeInto 触发。 */
@@ -363,7 +360,7 @@ function typeInto(conversationId: string, messageId: string, fullText: string) {
 
 /** 统一中止当前问答流和正文展示计时。由 onPageHide、stop 触发。 */
 function cancelStreams() {
-  for (const controller of streams.values()) controller.abort()
+  for (const { controller } of streams.values()) controller.abort()
 }
 
 /** 页面离开时停止进行中的问答或正文显示。下游调用 cancelStreams。 */
@@ -379,9 +376,10 @@ onMounted(() => {
     void loadSessions()
   }
 })
-onBeforeRouteLeave(() => {
-  // 页面离开时中止客户端请求。服务端停止执行由流式接口处理。
+onBeforeRouteLeave(async () => {
+  const pending = [...streams.values()]
   cancelStreams()
+  await Promise.all(pending.map(({ settled }) => settled))
 })
 onUnmounted(() => {
   window.removeEventListener('pagehide', onPageHide)
@@ -417,6 +415,7 @@ function readErrorField(cause: unknown, key: 'outcome' | 'reasonCode' | 'failedS
 function showResult(ai: ChatMessage, result: KnowledgeAskResponseDTO, content = '') {
   const presentation = presentRagResult(result)
   ai.content = presentation.showAnswer ? result.answer || content || '没有可展示的回答。' : ''
+  ai.provisional = false
   ai.sources = result.sources ?? []
   ai.showSources = presentation.showSources
   ai.exec = { engine: result.pipelineEngine, version: result.retrievalVersion, evidenceMode: result.evidenceMode }
@@ -449,14 +448,16 @@ async function send() {
   draft.value = ''
   pendingMode.value = engine
   const controller = new AbortController()
-  streams.set(aiId, controller)
+  let settle!: () => void
+  const settled = new Promise<void>((resolve) => { settle = resolve })
+  streams.set(aiId, { controller, settled })
   let streamed = ''
 
   try {
     await nextTick()
     scrollToBottom()
     if (!USE_MOCK && !conv.serverId) {
-      const session = await createRagSession(knowledgeBaseId)
+      const session = await createRagSession(knowledgeBaseId, controller.signal)
       conv.serverId = session.id
       const duplicate = conversations.value.findIndex((item) => item !== conv && item.serverId === session.id)
       if (duplicate !== -1) conversations.value.splice(duplicate, 1)
@@ -470,50 +471,56 @@ async function send() {
             /** 把上下文输入组织进度写入正在生成的消息。接收阶段数据。由 send 触发。 */
             onContext: (data) => {
               const target = conv.messages.find((item) => item.id === aiId)
-              if (!target) return
+              if (!target || controller.signal.aborted) return
               target.progressText = data.status === 'started' ? '正在整理上下文…' : '上下文已整理，正在继续处理…'
               target.contextNote = data.status === 'completed'
                 ? `已整理上下文：单次输入估算 ${data.inputTokensBefore} → ${data.inputTokensAfter} Token，可用 ${data.inputBudget}。`
                 : '本次单次输入超出容量，已触发上下文整理。'
             },
 
-            /** 把本次问答的正文增量追加到匹配的消息。接收文本。由 send 触发。 */
+            /** 追加正文增量，并标记 LangChain 正文仍在生成。接收文本。由 send 触发。 */
             onDelta: (text: string) => {
               const target = conv.messages.find((item) => item.id === aiId)
-              if (!target) return
+              if (!target || controller.signal.aborted) return
               streamed += text
               target.content = streamed
+              target.provisional = engine === 'langchain'
             },
           },
           controller.signal,
           strategy,
           conv.serverId,
         )
+    controller.signal.throwIfAborted()
     const ai = conv.messages.find((item) => item.id === aiId)
     if (!ai) return
-    showResult(ai, result, streamed)
-    if (!streamed && ai.content) {
+    showResult(ai, result, engine === 'fixed' ? streamed : '')
+    if ((engine === 'fixed' || USE_MOCK) && !streamed && ai.content) {
       const answer = ai.content
       ai.content = ''
       typeInto(conv.id, aiId, answer)
     }
   } catch (cause) {
     const ai = conv.messages.find((item) => item.id === aiId)
+    if (ai?.provisional) {
+      ai.content = ''
+      ai.provisional = false
+    }
     if (controller.signal.aborted) {
       if (ai) {
         ai.status = 'done'
         ai.typing = false
-        const stoppedMessage = streamed ? '本轮已停止，当前回答不完整。' : '本轮问答已停止，未生成完整回答。'
+        const stoppedMessage = ai.content ? '本轮已停止，当前回答不完整。' : '本轮问答已停止，未生成完整回答。'
         ai.notice = {
           theme: 'info',
-          text: engine === 'fixed' ? stoppedMessage : '已结束等待，本轮结果未返回。',
+          text: stoppedMessage,
         }
       }
     } else if (ai) {
       ai.status = 'done'
       const failureMessage = cause instanceof Error ? cause.message : '提问失败，请稍后重试。'
       ai.error = {
-        message: streamed
+        message: ai.content
           ? `${failureMessage} 已收到的部分内容不完整，不能作为完整回答。`
           : failureMessage,
         outcome: readErrorField(cause, 'outcome'),
@@ -525,6 +532,7 @@ async function send() {
   } finally {
     streams.delete(aiId)
     pendingMode.value = null
+    settle()
     await nextTick()
     scrollToBottom()
   }
@@ -632,7 +640,7 @@ watch(
           <span v-else class="setting-label">问答范围</span>
           <select v-if="!activeConv.serverId" id="ask-knowledge-base" v-model="activeConv.knowledgeBaseId"
             :disabled="sending || loadingKnowledgeBases" @change="clearRequestedScope">
-            <option :value="null">全部可读知识库 · 单轮</option>
+            <option :value="null">全部可读知识库 · 可追问</option>
             <option v-for="library in knowledgeBases" :key="library.id" :value="library.id">{{ library.name }} · 可追问</option>
           </select>
           <strong v-else class="ask-scope-value">{{ scopeLabel }}</strong>
@@ -652,7 +660,7 @@ watch(
       <div ref="scrollEl" class="messages">
         <div v-if="!activeConv.available" class="chat-empty" role="status">
           <p>知识库访问权限已变更</p>
-          <span>可以从左侧删除此会话。</span>
+          <span>请新建会话后继续提问。</span>
         </div>
         <div v-else-if="activeConv.historyLoading && !activeConv.messages.length" class="chat-empty" role="status">
           正在读取问答历史…
@@ -693,7 +701,7 @@ watch(
             <div class="bubble ai-bubble">
               <div v-if="msg.status === 'pending'" class="loading-state" role="status" aria-live="polite">
                 <span class="loading-dot" />
-                {{ msg.progressText || '正在检索相关文档并整理回答，请稍候…' }}
+                {{ msg.provisional ? '正在生成回答…' : msg.progressText || '正在检索相关文档并整理回答，请稍候…' }}
               </div>
 
               <t-alert
@@ -815,7 +823,7 @@ watch(
         <div class="composer-footer">
           <span class="shortcut-hint muted">Enter 发送 · Shift + Enter 换行</span>
           <div class="composer-actions">
-            <t-button v-if="pendingMode === 'fixed' && !USE_MOCK" theme="danger" variant="outline" @click="stop">
+            <t-button v-if="sending && !USE_MOCK" theme="danger" variant="outline" @click="stop">
               停止
             </t-button>
             <t-button

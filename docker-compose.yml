@@ -96,6 +96,8 @@ services:
       # 模型由 Java 管理并按请求传执行快照；本服务不再从环境选型或固定回退。
       MODEL_RESOURCE_GROUPS: ${MODEL_RESOURCE_GROUPS:-}
       MODEL_RESOURCE_QUEUE_LIMIT: ${MODEL_RESOURCE_QUEUE_LIMIT:-8}
+      MODEL_RESOURCE_REDIS_URL: ${MODEL_RESOURCE_REDIS_URL:-}
+      MODEL_RESOURCE_REDIS_NAMESPACE: ${MODEL_RESOURCE_REDIS_NAMESPACE:-ekip}
       # 本机调试模式默认关闭；临时覆盖见 docker-compose.dev-test.yml。
       EKIP_ENV: production
       RAG_DEV_TEST_MODE: "false"
@@ -183,6 +185,7 @@ services:
       MINIO_ACCESS_KEY: admin
       MINIO_SECRET_KEY: "12345678"
       MINIO_BUCKET: knowledge-files
+      STORAGE_RECLAIM_MODE: "${STORAGE_RECLAIM_MODE:-}"
       AI_BASE_URL: http://ai:8000
       # 内部鉴权令牌（2026-09-29）：**必须与 ai 侧同一个值**。Java 侧由 AiServiceClient 的
       # RestClient 拦截器统一带在 X-Internal-Token 上（一处注册覆盖全部调用），

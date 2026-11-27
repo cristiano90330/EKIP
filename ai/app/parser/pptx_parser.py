@@ -4,6 +4,7 @@ from typing import List
 
 from pptx import Presentation
 
+from ai.app.models.cancellation import check_cancelled
 from ai.app.parser.blocks import Block, BlockType
 
 
@@ -28,6 +29,7 @@ def extract_blocks(path: str) -> List[Block]:
     presentation = Presentation(path)
     blocks: List[Block] = []
     for slide_no, slide in enumerate(presentation.slides, start=1):
+        check_cancelled()
         title_shape = slide.shapes.title
         if title_shape is not None:
             title = "".join(run.text for run in title_shape.text_frame.paragraphs[0].runs).strip() \
@@ -37,6 +39,7 @@ def extract_blocks(path: str) -> List[Block]:
 
         table_seq = 0
         for shape in slide.shapes:
+            check_cancelled()
             if shape.has_table:
                 table_seq += 1
                 rows = [[cell.text.strip() for cell in row.cells] for row in shape.table.rows]
